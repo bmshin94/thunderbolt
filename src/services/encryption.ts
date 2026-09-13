@@ -115,6 +115,33 @@ export class RotationStaleError extends Error {
 }
 
 /**
+ * Thrown when a device revocation cut server access but the AK rotation that
+ * locks the device out did not land (THU-887). The `cause` is the underlying
+ * rotation failure.
+ *
+ * Its whole job is to record WHICH SIDE of the cut the failure happened on. The
+ * original defect was a UI that could not tell the difference and therefore said
+ * nothing; a message that hedges every outcome would be barely better. Because
+ * this type exists, a pre-cut failure can honestly say "nothing was changed" and
+ * a post-cut one can say "access was cut, your keys were not rotated" — see
+ * `describeRevokeFailure`.
+ *
+ * Recoverable, and not by retrying the revoke: the device is already revoked, so
+ * the outstanding work is the rotation alone (`finishDeviceLockout`). The server
+ * reports the account's outstanding rotations via `fetchLockoutPending`, so this
+ * error is the prompt, never the record.
+ */
+export class LockoutIncompleteError extends Error {
+  constructor(options?: ErrorOptions) {
+    super(
+      'The device lost access, but the account key was not rotated, so the device still holds a usable key.',
+      options,
+    )
+    this.name = 'LockoutIncompleteError'
+  }
+}
+
+/**
  * Thrown when the recovery anchor served for a phrase-preserving re-anchor
  * carries no attestation, or one that does not verify under this device's own
  * key material (THU-865). Deliberately NOT retryable: retrying re-reads the
@@ -900,7 +927,7 @@ export const setDeviceNodeIdWithProof = async (
  * metadata (404) or a v1 leftover (NULL signing_public_key) → no proof needed
  * (the backend skips verification for those accounts).
  */
-const buildRevokeProof = async (httpClient: HttpClient): Promise<ChallengeProof | undefined> => {
+const buildRevokeProof = async (httpClient: HttpClient, canarySecret?: string): Promise<ChallengeProof | undefined> => {
   const metadata = await fetchEncryptionMetadata(httpClient).catch((err: unknown) => {
     if (err instanceof HttpError && err.response.status === 404) {
       return null
@@ -910,7 +937,7 @@ const buildRevokeProof = async (httpClient: HttpClient): Promise<ChallengeProof 
   if (!metadata || metadata.signing_public_key == null) {
     return undefined
   }
-  return buildProof(httpClient, 'revoke')
+  return buildProof(httpClient, 'revoke', canarySecret)
 }
 
 /**
@@ -918,9 +945,17 @@ const buildRevokeProof = async (httpClient: HttpClient): Promise<ChallengeProof 
  * Falls back to no proof for pre-E2EE users and v1 leftovers. Note: this only
  * cuts server access — `revokeDeviceAndRotate` also locks the device out of
  * the keyring cryptographically.
+ *
+ * `canarySecret` is an optional pre-recovered secret, passed by
+ * `revokeDeviceAndRotate` so the whole revocation extracts it once instead of
+ * once per step.
  */
-export const revokeDeviceWithProof = async (httpClient: HttpClient, deviceId: string): Promise<void> => {
-  const proof = await buildRevokeProof(httpClient).catch((err: unknown) => {
+export const revokeDeviceWithProof = async (
+  httpClient: HttpClient,
+  deviceId: string,
+  canarySecret?: string,
+): Promise<void> => {
+  const proof = await buildRevokeProof(httpClient, canarySecret).catch((err: unknown) => {
     trackError(
       createHandleError('CANARY_EXTRACTION_FAILED', 'Failed to build challenge proof during device revocation', err),
     )
@@ -1394,12 +1429,23 @@ export const changeRecoveryPhrase = async (
  * the minted DEK is wrapped under the same AK the request installs, so it can
  * never be stranded under a stale one.
  *
- * ORDER IS STILL LOAD-BEARING. The rotation replaces the account's canary and
- * signing key and is the only step unrecoverable from a partial run — the local
- * AK and the server's diverge until a refresh — so it goes LAST. Revocation
- * committing first is deliberate and safe: the keyring endpoints reject revoked
- * callers, and re-running a revoke is a no-op server-side, so the whole flow is
- * retryable.
+ * ORDER IS LOAD-BEARING, AND THE CUT GOES FIRST ON PURPOSE (THU-887). Cutting
+ * server access is the EMERGENCY half — someone is revoking a lost or stolen
+ * device — while replacing the AK is the half that can fail. Making them one
+ * atomic operation was tried and rejected: it puts the emergency behind the
+ * failure-prone step, and two consequences were proved against it. A device
+ * with a live session can deny its own revocation by looping `rotateAccountKey`
+ * (every rotation replaces the signing key, invalidating the admin's in-flight
+ * proof), and two devices whose public keys will not import wedge revocation
+ * permanently, because revoking either still requires wrapping an envelope for
+ * the other. Committing the cut independently is what keeps repair MONOTONE.
+ *
+ * So the residual is deliberate: between the cut and the rotation the removed
+ * device still holds a live AK. It cannot reach the server, but it can read
+ * what it already had plus anything written in that window. What closes the
+ * loop is not atomicity but visibility — `listDevicesAwaitingLockout` makes an
+ * outstanding rotation an observable account fact, so the UI can report it and
+ * ANY device can finish it (see `finishDeviceLockout`).
  *
  * Remaining devices self-heal: their next decode of post-rotation data hits a
  * DEK that won't unwrap under their old AK, which triggers the responder's
@@ -1410,9 +1456,52 @@ export const revokeDeviceAndRotate = async (
   deviceId: string,
   opts: Pick<RotateAKOptions, 'listTrustedDevices'> = {},
 ): Promise<void> => {
-  await revokeDeviceWithProof(httpClient, deviceId)
-  await rotateAccountKey(httpClient, { ...opts, excludeDeviceIds: [deviceId], mintNewPrimary: true })
+  // Extracted ONCE for the whole revocation: the pre-flight below and the
+  // revoke proof both need it, and each used to recover it separately.
+  const canarySecret = await getCanarySecret(httpClient)
+
+  // PRE-FLIGHT, DELIBERATELY DISCARDED. This is the check that fails closed on
+  // a served recovery anchor that does not verify (THU-865) and on an account
+  // with no recovery slot at all — between them the likeliest way the rotation
+  // below dies. Running it BEFORE the cut turns both into an abort with nothing
+  // applied, instead of a device that looks revoked and is not locked out.
+  //
+  // The result is NOT handed to the rotation, which must re-read the anchor
+  // itself: a phrase change on another device between here and there would
+  // otherwise be silently reverted by this stale-but-verified copy. One extra
+  // metadata fetch is the price of that, and it buys the narrower window.
+  await readStoredRecoveryPlan(httpClient, canarySecret)
+
+  await revokeDeviceWithProof(httpClient, deviceId, canarySecret)
+
+  // Past the cut. Everything from here is the rotation, and a failure means the
+  // device is revoked but not locked out — tagged rather than propagated raw so
+  // the UI can say which of the two happened instead of hedging both.
+  try {
+    await rotateAccountKey(httpClient, { ...opts, excludeDeviceIds: [deviceId], mintNewPrimary: true })
+  } catch (err) {
+    throw new LockoutIncompleteError({ cause: err })
+  }
 }
+
+/**
+ * Finish a revocation whose AK rotation never landed (THU-887): rotate the AK
+ * and mint the fresh primary DEK that gives forward secrecy over the key the
+ * removed device held.
+ *
+ * Takes no device id, and needs none — the target is already revoked, so it is
+ * already absent from the server's own `listEnvelopeCapableDevices` predicate
+ * and needs no exclusion. Callers find the accounts that need this from
+ * `fetchLockoutPending`, not from local state, which is what lets a revocation
+ * that failed on one device be completed from another.
+ *
+ * Never called automatically. An auto-retry driven by a server-supplied "this
+ * is owed" signal would hand a malicious server an induced-rotation loop, and
+ * every rotation mints a keyring row — inventing a denial-of-service to fix a
+ * visibility bug.
+ */
+export const finishDeviceLockout = (httpClient: HttpClient): Promise<void> =>
+  rotateAccountKey(httpClient, { mintNewPrimary: true })
 
 // =============================================================================
 // WS4 — Migrator (v1 → v2)

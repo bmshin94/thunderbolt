@@ -2,9 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import type { ReactNode } from 'react'
+
+import { Button } from '@/components/ui/button'
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -19,6 +21,14 @@ type RevokeDeviceDialogProps = {
   onConfirm: () => void
   isPending: boolean
   variant: 'trusted' | 'pending'
+  /**
+   * Rendered above the footer when the last attempt failed. The dialog stays
+   * OPEN on failure so this sits next to the button that retries it — see the
+   * confirm control below.
+   */
+  error?: string | null
+  /** Optional action beside the error, e.g. "Change recovery phrase". */
+  errorAction?: ReactNode
 }
 
 /**
@@ -35,18 +45,47 @@ const descriptions = {
   pending: 'This will deny the device access to your encrypted data. The device will need to set up sync again.',
 }
 
-export const RevokeDeviceDialog = ({ open, onOpenChange, onConfirm, isPending, variant }: RevokeDeviceDialogProps) => (
+export const RevokeDeviceDialog = ({
+  open,
+  onOpenChange,
+  onConfirm,
+  isPending,
+  variant,
+  error,
+  errorAction,
+}: RevokeDeviceDialogProps) => (
   <AlertDialog open={open} onOpenChange={onOpenChange}>
     <AlertDialogContent>
       <AlertDialogHeader>
         <AlertDialogTitle>{variant === 'pending' ? 'Deny this device?' : 'Revoke this device?'}</AlertDialogTitle>
         <AlertDialogDescription>{descriptions[variant]}</AlertDialogDescription>
       </AlertDialogHeader>
+      {error && (
+        <div className="flex flex-col gap-2">
+          <p className="text-[length:var(--font-size-sm)] text-destructive" role="alert">
+            {error}
+          </p>
+          {errorAction}
+        </div>
+      )}
       <AlertDialogFooter>
         <AlertDialogCancel disabled={isPending}>Cancel</AlertDialogCancel>
-        <AlertDialogAction onClick={onConfirm} disabled={isPending}>
-          {isPending ? (variant === 'pending' ? 'Denying…' : 'Revoking…') : variant === 'pending' ? 'Deny' : 'Revoke'}
-        </AlertDialogAction>
+        {/*
+          A plain Button, NOT AlertDialogAction, which is a Radix
+          `DialogPrimitive.Close` and would dismiss the dialog on click whether
+          the mutation resolved or rejected — the second half of THU-887. The
+          caller closes it from the mutation's own success callback instead, so a
+          failure keeps this button on screen as the retry affordance. Same
+          reasoning (and the same shape) as the Change Recovery Phrase dialog.
+        */}
+        <Button
+          onClick={onConfirm}
+          disabled={isPending}
+          isLoading={isPending}
+          loadingLabel={variant === 'pending' ? 'Denying…' : 'Revoking…'}
+        >
+          {variant === 'pending' ? 'Deny' : 'Revoke'}
+        </Button>
       </AlertDialogFooter>
     </AlertDialogContent>
   </AlertDialog>

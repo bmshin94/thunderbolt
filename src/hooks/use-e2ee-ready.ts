@@ -24,11 +24,18 @@ export const useE2eeReady = (): boolean => {
   // Legitimate useEffect: async IndexedDB read on mount.
   useEffect(() => {
     let cancelled = false
-    isE2eeReady().then((value) => {
-      if (!cancelled) {
-        setReady(value)
-      }
-    })
+    isE2eeReady()
+      // A key store this device cannot read is not a ready one. Swallowing to
+      // `false` rather than rejecting keeps an unavailable IndexedDB (blocked
+      // storage, private browsing) from surfacing as an unhandled rejection in
+      // whatever settings surface happens to mount this — the app already has a
+      // dedicated screen for genuinely unusable storage.
+      .catch(() => false)
+      .then((value) => {
+        if (!cancelled) {
+          setReady(value)
+        }
+      })
     return () => {
       cancelled = true
     }

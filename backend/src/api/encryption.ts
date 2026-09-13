@@ -18,6 +18,7 @@ import {
   getTrustedNodeIds,
   listEnvelopeCapableDeviceIds,
   listEnvelopeCapableDevices,
+  listDevicesAwaitingLockout,
   getEnvelopeByDeviceId,
   hasEnvelopesForUser,
   upsertEnvelope,
@@ -813,6 +814,32 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
             mlkem_public_key: device.mlkemPublicKey,
           })),
         }
+      },
+      { auth: true },
+    )
+    // Revoked devices whose AK rotation never landed (THU-887). Revoking cuts
+    // server access in its own transaction and replaces the AK in a second one;
+    // when the second fails, the device is revoked while the AK it holds is
+    // still the live one. This endpoint is what turns that into an observable
+    // account fact, so the UI can report it and ANY device can finish the job —
+    // see `listDevicesAwaitingLockout` for why the keyring is the clock.
+    //
+    // DEVICE-GATED, deliberately. The obvious home for this would be the
+    // metadata response, but `GET /encryption/canary` is `{ auth: true }` only,
+    // and `attacks/canary-route-ungated.spec.ts` already tracks that as an open
+    // metadata-hygiene defect — widening what an unbound session learns would
+    // make a tagged finding worse.
+    .get(
+      '/encryption/lockout-pending',
+      async ({ request, set, user: sessionUser, session }) => {
+        const userId = sessionUser!.id
+        const caller = await getCallerDevice(database, userId, request, session)
+        if ('error' in caller) {
+          set.status = caller.status
+          return { error: caller.error }
+        }
+
+        return { device_ids: await listDevicesAwaitingLockout(database, userId) }
       },
       { auth: true },
     )

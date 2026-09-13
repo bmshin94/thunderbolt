@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import type { db as DbType, QueryableDatabase } from '@/db/client'
-import { devicesTable } from '@/db/schema'
-import { and, count, eq, isNotNull, isNull, or } from 'drizzle-orm'
+import { devicesTable, wrappedKeysTable } from '@/db/schema'
+import { and, count, eq, isNotNull, isNull, or, sql } from 'drizzle-orm'
 import { createHash } from 'crypto'
 
 /** Deterministic device id for a bridge, derived from (userId, nodeId). Keying the row on this
@@ -218,6 +218,43 @@ export const listEnvelopeCapableDevices = async (database: QueryableDatabase, us
  */
 export const listEnvelopeCapableDeviceIds = async (database: QueryableDatabase, userId: string) =>
   (await listEnvelopeCapableDevices(database, userId)).map((row) => row.id)
+
+/**
+ * Revoked devices that were never cryptographically locked out (THU-887): ones
+ * revoked AFTER the account's last AK rotation, so the AK they still hold is
+ * the live one. Cutting server access and replacing the AK are two operations
+ * and the second can fail; this is what makes an outstanding rotation an
+ * observable account fact rather than an invisible half-state.
+ *
+ * THE KEYRING IS THE ROTATION CLOCK. Every AK rotation re-wraps EVERY row and
+ * `updateWrappedKey` stamps `updated_at`, so `MAX(updated_at)` is the time of
+ * the last rotation. `encryption_metadata` carries no `updated_at` at all —
+ * only `created_at` — which is why the clock lives here and not on the row that
+ * holds `key_version`.
+ *
+ * Returns ids the SERVER derived, so a revocation that failed on one device is
+ * visible to every other one, and a later recovery-phrase change clears the
+ * list honestly: a phrase change IS an AK rotation, so the device really did
+ * get locked out. An account with no keyring (pre-E2EE) yields nothing, since
+ * `MAX` over zero rows is NULL and the comparison is then false.
+ */
+export const listDevicesAwaitingLockout = async (database: QueryableDatabase, userId: string): Promise<string[]> => {
+  const rows = await database
+    .select({ id: devicesTable.id })
+    .from(devicesTable)
+    .where(
+      and(
+        eq(devicesTable.userId, userId),
+        isNotNull(devicesTable.revokedAt),
+        sql`${devicesTable.revokedAt} > (
+          SELECT MAX(${wrappedKeysTable.updatedAt})
+          FROM ${wrappedKeysTable}
+          WHERE ${wrappedKeysTable.userId} = ${userId}
+        )`,
+      ),
+    )
+  return rows.map((row) => row.id)
+}
 
 /**
  * Register (or idempotently re-register) a BRIDGE device on the caller's account.

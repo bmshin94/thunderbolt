@@ -17,6 +17,7 @@ export {
   getTrustedNodeIds,
   listEnvelopeCapableDeviceIds,
   listEnvelopeCapableDevices,
+  listDevicesAwaitingLockout,
   countActiveDevices,
 } from './devices'
 

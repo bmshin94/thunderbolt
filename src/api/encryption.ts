@@ -20,6 +20,7 @@ import type {
   WrappedKeyResponse,
   WrappedKeysListResponse,
   EnvelopeTargetsResponse,
+  LockoutPendingResponse,
 } from '@shared/e2ee-types'
 
 // The authenticated HttpClient (`createAuthenticatedClient`) already attaches
@@ -190,6 +191,14 @@ export const fetchWrappedKey = async (httpClient: HttpClient, keyId: KeyId): Pro
  */
 export const fetchEnvelopeTargets = async (httpClient: HttpClient): Promise<EnvelopeTargetsResponse> =>
   httpClient.get('encryption/envelope-targets').json<EnvelopeTargetsResponse>()
+
+/**
+ * Revoked devices still awaiting the AK rotation that locks them out (THU-887).
+ * Server-derived, so a revocation that failed on one device shows up on every
+ * other one — which is what lets any of them finish it (`finishDeviceLockout`).
+ */
+export const fetchLockoutPending = async (httpClient: HttpClient): Promise<LockoutPendingResponse> =>
+  httpClient.get('encryption/lockout-pending').json<LockoutPendingResponse>()
 
 // =============================================================================
 // Challenge-response + rotation + upgrade

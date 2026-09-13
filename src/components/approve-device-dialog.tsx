@@ -2,9 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { Button } from '@/components/ui/button'
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -12,16 +12,21 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Loader2 } from 'lucide-react'
 
 type ApproveDeviceDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
   onConfirm: () => void
   isPending: boolean
+  /**
+   * Rendered above the footer when the last attempt failed. The dialog stays
+   * OPEN on failure so this sits next to the button that retries it — see the
+   * confirm control below.
+   */
+  error?: string | null
 }
 
-export const ApproveDeviceDialog = ({ open, onOpenChange, onConfirm, isPending }: ApproveDeviceDialogProps) => (
+export const ApproveDeviceDialog = ({ open, onOpenChange, onConfirm, isPending, error }: ApproveDeviceDialogProps) => (
   <AlertDialog open={open} onOpenChange={onOpenChange}>
     <AlertDialogContent>
       <AlertDialogHeader>
@@ -30,18 +35,23 @@ export const ApproveDeviceDialog = ({ open, onOpenChange, onConfirm, isPending }
           This will share your encryption key with the device, allowing it to decrypt and sync your data.
         </AlertDialogDescription>
       </AlertDialogHeader>
+      {error && (
+        <p className="text-[length:var(--font-size-sm)] text-destructive" role="alert">
+          {error}
+        </p>
+      )}
       <AlertDialogFooter>
         <AlertDialogCancel disabled={isPending}>Cancel</AlertDialogCancel>
-        <AlertDialogAction onClick={onConfirm} disabled={isPending}>
-          {isPending ? (
-            <>
-              <Loader2 className="size-4 mr-1 animate-spin" />
-              Approving…
-            </>
-          ) : (
-            'Approve'
-          )}
-        </AlertDialogAction>
+        {/*
+          A plain Button, NOT AlertDialogAction, which is a Radix
+          `DialogPrimitive.Close` and would dismiss the dialog whether the
+          mutation resolved or rejected (THU-887). The caller closes it from the
+          mutation's success callback instead, so a failure keeps this button on
+          screen as the retry.
+        */}
+        <Button onClick={onConfirm} disabled={isPending} isLoading={isPending} loadingLabel="Approving…">
+          Approve
+        </Button>
       </AlertDialogFooter>
     </AlertDialogContent>
   </AlertDialog>

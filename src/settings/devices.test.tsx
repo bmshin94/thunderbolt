@@ -227,9 +227,12 @@ describe('DevicesSettingsPage reactivity', () => {
       await getClock().runAllAsync()
     })
 
-    expect(requests).toHaveLength(1)
-    expect(requests[0]?.method).toBe('DELETE')
-    expect(new URL(requests[0]!.url).pathname).toBe(`/v1/devices/${revokedBridgeId}`)
+    // Filtered rather than counted: the page also reads the owed-lockout set
+    // (THU-887), and this test's subject is which request removes the bridge,
+    // not how many the page makes in total.
+    const removals = requests.filter((request) => request.method === 'DELETE')
+    expect(removals).toHaveLength(1)
+    expect(new URL(removals[0]!.url).pathname).toBe(`/v1/devices/${revokedBridgeId}`)
     expect(screen.queryByText('Remove this bridge?')).not.toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })

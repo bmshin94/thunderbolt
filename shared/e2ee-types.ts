@@ -505,6 +505,19 @@ export type EnvelopeTargetsResponse = {
 }
 
 /**
+ * GET /v1/encryption/lockout-pending — revoked devices whose AK rotation never
+ * landed (THU-887), so the AK they still hold is the account's live one.
+ *
+ * Server-derived from `devices.revoked_at` against the keyring's last write, so
+ * it is authoritative for the whole account rather than remembered by whichever
+ * device happened to fail: any device can read this and finish the rotation.
+ * Empty on a healthy account, and on any account with no keyring at all.
+ */
+export type LockoutPendingResponse = {
+  device_ids: string[]
+}
+
+/**
  * The recovery slot every v2 write path must supply as a complete triple: the
  * phrase-derived hybrid PUBLIC keys plus the AK wrapped to them. A silent
  * rotation resubmits the STORED public keys (the phrase keeps working); an
