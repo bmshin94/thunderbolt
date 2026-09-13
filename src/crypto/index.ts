@@ -70,6 +70,7 @@ export {
   getAK,
   storeDEK,
   getDEK,
+  getLegacyCK,
   stageWrappedDEKs,
   listDEKs,
   pruneStagedDEKs,

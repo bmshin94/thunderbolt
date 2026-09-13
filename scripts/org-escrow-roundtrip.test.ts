@@ -187,8 +187,13 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
     const recoveredAk = await unwrapEscrowedAK(parseOrgEnvelope(envelope), keypair.privateKey)
     const deks = await unwrapKeyring([{ keyId: '0', wrappedKey: primary.wrappedKey }], recoveredAk)
 
-    expect(decryptCellValue(wire, deks, { table: 'tasks', column: 'item', rowId: 'other-row' })).rejects.toThrow(
-      /AAD mismatch/,
-    )
+    // `fix: scope escrow row lookup by user_id` reworded this error to lead with
+    // the wrong-key case (another account's row), since row ids are not unique
+    // across accounts. Match the AAD clause rather than the old "AAD mismatch"
+    // wording, and AWAIT the assertion — without it the rejection is unobserved
+    // and the test passes vacuously.
+    await expect(
+      decryptCellValue(wire, deks, { table: 'tasks', column: 'item', rowId: 'other-row' }),
+    ).rejects.toThrow(/AAD does not match/)
   })
 })

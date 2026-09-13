@@ -33,6 +33,7 @@ import {
   signRecoveryAttestation,
   verifyRecoveryAttestation,
   decrypt,
+  encrypt,
   generateRecoverySeed,
   encodeRecoverySeed,
   decodeRecoveryKey,
@@ -45,6 +46,7 @@ import {
   getAK,
   storeDEK,
   getDEK,
+  getLegacyCK,
   stageWrappedDEKs,
   pruneStagedDEKs,
   storePrimaryKeyId,
@@ -1430,6 +1432,102 @@ export type MigrateToV2Options = {
   getLegacyV1Sample?: () => Promise<LegacyV1Sample | null>
 }
 
+/** The legacy CK the migrator will absorb, plus the D1 possession proof it produced. */
+type AbsorbedLegacyCK = { legacyCK: CryptoKey; possessionProof: string }
+
+/**
+ * Whether `candidate` is the same AES-GCM key as the CK this device kept from v1.
+ *
+ * A probe rather than a byte comparison because v1 stored the CK
+ * NON-EXTRACTABLE (`storeCK(nonExtractableCK)` on the v1 branch), so neither key
+ * can be exported — and for the same reason the local copy can never be wrapped
+ * into the keyring itself. Sealing under one key and opening under the other
+ * proves equality without extracting either: a GCM auth tag cannot be satisfied
+ * by a different key.
+ */
+const ckMatchesLocal = async (localCK: CryptoKey, candidate: CryptoKey): Promise<boolean> => {
+  const probe = crypto.randomUUID()
+  const sealed = await encrypt(probe, localCK)
+  try {
+    return (await decrypt(sealed, candidate)) === probe
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Refuse a server-offered legacy CK that provably is not this account's (THU-877).
+ *
+ * FAILS CLOSED, unlike `runContinuityCheck`, which runs the same shape on the
+ * FOLLOWER path behind the server-side D1 proof and must never block an unlock.
+ * Here the envelope is the only thing between a forged CK and every pre-migration
+ * row, and absorbing the wrong one seals that data under a key nobody holds. It
+ * throws rather than returning `not-eligible` because a provably-wrong CK is
+ * tampering, not an ineligible device, and must not be retried silently at boot.
+ *
+ * Order matters. A candidate that decrypts this account's own legacy ciphertext
+ * IS the CK — a GCM auth tag cannot be forged — so that check settles the
+ * question and returns. Only when no legacy row has synced yet does the locally
+ * retained CK become the anchor.
+ *
+ * That ordering is deliberate: comparing against the local CK FIRST would reject
+ * a legitimate migration on a browser carrying a previous account's leftover CK
+ * (a wipe that threw and was logged-and-continued, `src/lib/cleanup.ts`). Once a
+ * sample has settled it, the local copy is never consulted, so that false
+ * positive is confined to the no-sample case — where it is loud, and where the
+ * alternative is poisoning the keyring for every device on the account.
+ *
+ * Residual: with neither a synced legacy row nor a local CK there is nothing to
+ * verify against and a forged envelope is still absorbed. Siblings then refuse the
+ * poisoned keyring in `followToV2`, so it cannot spread past this device.
+ */
+const assertCandidateCKIsOurs = async (
+  candidate: CryptoKey,
+  getSample: () => Promise<LegacyV1Sample | null>,
+): Promise<void> => {
+  const sample = await getSample()
+  if (sample) {
+    if (!(await ckOpensLegacySample(candidate, sample))) {
+      throw new Error(
+        "E2EE migration aborted — the legacy key the server offered cannot decrypt this account's own legacy " +
+          'data, so absorbing it would orphan every pre-migration row (THU-877)',
+      )
+    }
+    return
+  }
+
+  const localCK = await getLegacyCK()
+  if (localCK && !(await ckMatchesLocal(localCK, candidate))) {
+    throw new Error(
+      'E2EE migration aborted — the legacy key the server offered does not match the one this device kept from ' +
+        'v1 (THU-877)',
+    )
+  }
+}
+
+/** Unwrap the legacy CK from this device's v1 envelope and prove it is ours before absorbing it. */
+const resolveLegacyCK = async (
+  httpClient: HttpClient,
+  canary: { iv: string; ctext: string },
+  keyPair: StoredKeyPair,
+  getSample: () => Promise<LegacyV1Sample | null>,
+): Promise<AbsorbedLegacyCK | null> => {
+  const { wrappedCK } = await fetchMyEnvelope(httpClient)
+  const legacyCK = await unwrapLegacyCK(wrappedCK, keyPair.ecdhPrivateKey, keyPair.mlkemSecretKey).catch(() => null)
+  if (!legacyCK) {
+    return null
+  }
+  // D1 possession proof: only a CK matching the served canary recovers its secret.
+  // A2 authors both the envelope and the canary, so this alone proves nothing —
+  // hence the check below, against material A2 does not author.
+  const possessionProof = await recoverCanarySecretV1(legacyCK, canary.iv, canary.ctext)
+  if (!possessionProof) {
+    return null
+  }
+  await assertCandidateCKIsOurs(legacyCK, getSample)
+  return { legacyCK, possessionProof }
+}
+
 /**
  * Migrate this v1 account to v2 (WS4). Eligibility: `scheme_version == 1`, this
  * device holds the legacy CK (its v1 envelope unwraps and decrypts the canary),
@@ -1460,18 +1558,19 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
     return { outcome: 'not-eligible' }
   }
 
-  // Absorb: this device's v1 envelope carries the legacy CK.
-  const { wrappedCK: v1Envelope } = await fetchMyEnvelope(httpClient)
-  const legacyCK = await unwrapLegacyCK(v1Envelope, keyPair.ecdhPrivateKey, keyPair.mlkemSecretKey).catch(() => null)
-  if (!legacyCK) {
+  // Absorb the legacy CK — preferring this device's own copy over the one the
+  // server offers, and never absorbing a server-offered CK that cannot open this
+  // account's real legacy data (THU-877).
+  const absorbed = await resolveLegacyCK(
+    httpClient,
+    { iv: metadata.canary_iv, ctext: metadata.canary_ctext },
+    keyPair,
+    opts.getLegacyV1Sample ?? defaultGetLegacyV1Sample,
+  )
+  if (!absorbed) {
     return { outcome: 'not-eligible' }
   }
-
-  // D1 possession proof: only the real CK recovers the v1 canary secret.
-  const possessionProof = await recoverCanarySecretV1(legacyCK, metadata.canary_iv, metadata.canary_ctext)
-  if (!possessionProof) {
-    return { outcome: 'not-eligible' }
-  }
+  const { legacyCK, possessionProof } = absorbed
 
   // Mint the new AK + fresh primary DEK '0'; absorb the CK as the '"v1"' slot.
   const recovery = await mintRecoveryPlan()
@@ -1638,6 +1737,15 @@ const defaultGetLegacyV1Sample = async (): Promise<LegacyV1Sample | null> => {
  * because it is the only thing standing between a malicious server and every
  * future write. Do not harmonize them.
  */
+const ckOpensLegacySample = async (ck: CryptoKey, sample: LegacyV1Sample): Promise<boolean> => {
+  try {
+    await decrypt({ iv: sample.iv, ciphertext: sample.ciphertext }, ck)
+    return true
+  } catch {
+    return false
+  }
+}
+
 const runContinuityCheck = async (
   ak: CryptoKey,
   keyring: WrappedKeyEntry[],
@@ -1653,9 +1761,9 @@ const runContinuityCheck = async (
     return
   }
   const v1Dek = await unwrapDEK(wrappedV1, ak)
-  await decrypt({ iv: sample.iv, ciphertext: sample.ciphertext }, v1Dek).catch(() => {
+  if (!(await ckOpensLegacySample(v1Dek, sample))) {
     throw new Error('E2EE continuity check failed — the staged keyring could not decrypt legacy data')
-  })
+  }
 }
 
 /**

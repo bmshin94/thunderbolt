@@ -34,6 +34,12 @@ const dekIdPrefix = 'thunderbolt_dek_'
 const primaryKeyIdId = 'thunderbolt_primary_key_id'
 const keyVersionId = 'thunderbolt_key_version'
 const keyringAnchorId = 'thunderbolt_keyring_anchor'
+/**
+ * The v1 content key, left in place by the non-destructive db bump above. v2
+ * never WRITES this entry — it exists only so the v1->v2 migrator can prefer the
+ * CK this device already holds over the one the server offers (THU-877).
+ */
+const legacyCkId = 'thunderbolt_ck'
 
 const dekEntryId = (keyId: KeyId): string => `${dekIdPrefix}${keyId}`
 
@@ -208,6 +214,18 @@ export const storeAK = async (ak: CryptoKey): Promise<void> => putValue(akId, ak
 
 /** Get the account key from IndexedDB. */
 export const getAK = async (): Promise<CryptoKey | null> => getValue<CryptoKey>(akId)
+
+/**
+ * The v1 content key this device kept from before the upgrade, or null when it
+ * has none (IndexedDB wiped, or a device that never completed v1 setup).
+ *
+ * Read-only and deliberately never written by v2. It is the one piece of legacy
+ * key material a malicious server cannot influence, which is what lets
+ * `migrateToV2` absorb a CK it has not been handed (THU-877). Survival across the
+ * scheme bump is an invariant with a committed test — see the `dbVersion` note at
+ * the top of this file and `key-storage.test.ts`.
+ */
+export const getLegacyCK = async (): Promise<CryptoKey | null> => getValue<CryptoKey>(legacyCkId)
 
 /**
  * Store one DEK as its wrapped base64 AES-KW blob (NOT a CryptoKey). The

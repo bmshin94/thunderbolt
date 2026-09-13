@@ -51,6 +51,8 @@ let storedKeyVersion: number | null = null
 let storedKeyringAnchor: KeyringAnchor | null = null
 /** Simulates an IndexedDB write failure inside `storeAK` (post-commit staging). */
 let failStoreAK = false
+/** The v1 CK a formerly-v1 device kept through the non-destructive db bump (THU-877). */
+let storedLegacyCK: CryptoKey | null = null
 
 // Capture the real module (spread into a fresh object — bun's mock.module mutates
 // the live namespace in place, so only a value-copy survives) so afterAll can
@@ -78,6 +80,7 @@ mock.module('@/crypto/key-storage', () => ({
     storedAK = ak
   },
   getAK: async () => storedAK,
+  getLegacyCK: async () => storedLegacyCK,
   storeDEK: async (keyId: KeyId, wrapped: string) => {
     storedDEKs.set(keyId, wrapped)
   },
@@ -103,6 +106,7 @@ mock.module('@/crypto/key-storage', () => ({
   clearAllKeys: async () => {
     storedKeyPair = null
     storedAK = null
+    storedLegacyCK = null
     storedDEKs.clear()
     storedPrimaryKeyId = null
     storedKeyVersion = null
@@ -569,6 +573,7 @@ describe('encryption service (v2)', () => {
     setCachedSession({ user: { id: testUserId }, session: { expiresAt: new Date(Date.now() + 3_600_000) } })
     storedKeyPair = null
     storedAK = null
+    storedLegacyCK = null
     storedDEKs.clear()
     storedPrimaryKeyId = null
     storedKeyVersion = null
@@ -1637,6 +1642,118 @@ describe('encryption service (v2)', () => {
 
       expect(result.outcome).toBe('followed')
       expect(storedAK).not.toBeNull() // obtained via the follower path
+    })
+  })
+
+  describe('migrateToV2 — forged v1 envelope (THU-877)', () => {
+    /** A2 swaps BOTH the envelope and the canary, so the D1 possession proof is self-consistent. */
+    const forgeEnvelopeAndCanary = async (server: FakeServer, kp: StoredKeyPair): Promise<void> => {
+      const attackerCK = await generateDEK(true)
+      const forgedCanary = await encrypt('thunderbolt-canary-v1:forged-secret', attackerCK)
+      server.envelopes.set('test-device-id', await wrapAK(attackerCK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+      server.metadata!.canaryIv = forgedCanary.iv
+      server.metadata!.canaryCtext = forgedCanary.ciphertext
+    }
+
+    it("aborts when the offered CK cannot decrypt the account's own legacy data", async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      const { legacyCK } = await seedV1Account(server, kp)
+      const legacySample = await encrypt('hello legacy', legacyCK)
+      await forgeEnvelopeAndCanary(server, kp)
+
+      await expect(
+        migrateToV2(clientFor(server), {
+          listTrustedDevices: async () => [await deviceKeysFor(kp, 'test-device-id')],
+          getLegacyV1Sample: async () => legacySample,
+        }),
+      ).rejects.toThrow(/cannot decrypt this account's own legacy/)
+
+      // Nothing committed: the account stays on v1 with its data intact, so the
+      // migration retries cleanly once the server serves the genuine envelope.
+      expect(server.metadata!.schemeVersion).toBe(1)
+      expect(storedAK).toBeNull()
+      expect(storedDEKs.has('v1')).toBe(false)
+    })
+
+    it('falls back to the CK this device kept from v1 when no legacy row has synced yet', async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      const { legacyCK } = await seedV1Account(server, kp)
+      // The genuine CK, retained through the non-destructive db bump. It can never
+      // be absorbed (v1 stored it non-extractable) — only compared against.
+      storedLegacyCK = legacyCK
+      await forgeEnvelopeAndCanary(server, kp)
+
+      await expect(
+        migrateToV2(clientFor(server), {
+          listTrustedDevices: async () => [await deviceKeysFor(kp, 'test-device-id')],
+          getLegacyV1Sample: async () => null,
+        }),
+      ).rejects.toThrow(/does not match the one this device kept from v1/)
+
+      expect(server.metadata!.schemeVersion).toBe(1)
+      expect(storedDEKs.has('v1')).toBe(false)
+    })
+
+    it('a genuine envelope still migrates, and the absorbed slot decrypts legacy data', async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      const { legacyCK } = await seedV1Account(server, kp)
+      const legacyValue = await encrypt('hello legacy', legacyCK)
+      storedLegacyCK = legacyCK
+
+      const result = await migrateToV2(clientFor(server), {
+        listTrustedDevices: async () => [await deviceKeysFor(kp, 'test-device-id')],
+        getLegacyV1Sample: async () => legacyValue,
+      })
+
+      expect(result.outcome).toBe('migrated')
+      const v1Dek = await unwrapDEK(storedDEKs.get('v1')!, storedAK!)
+      expect(await decrypt(legacyValue, v1Dek)).toBe('hello legacy')
+    })
+
+    it("does not block a legitimate migration on another account's leftover CK", async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      const { legacyCK } = await seedV1Account(server, kp)
+      const legacyValue = await encrypt('hello legacy', legacyCK)
+
+      // A previous account's CK, left behind by a wipe that threw and was
+      // logged-and-continued (`src/lib/cleanup.ts`). The synced legacy row settles
+      // the question first, so the stale local copy is never consulted — without
+      // that ordering this migration would abort on a false mismatch.
+      storedLegacyCK = await generateDEK(true)
+
+      const result = await migrateToV2(clientFor(server), {
+        listTrustedDevices: async () => [await deviceKeysFor(kp, 'test-device-id')],
+        getLegacyV1Sample: async () => legacyValue,
+      })
+
+      expect(result.outcome).toBe('migrated')
+    })
+
+    it('ACCEPTED RESIDUAL: with no legacy row and no local CK, a forged envelope is still absorbed', async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      await seedV1Account(server, kp)
+      storedLegacyCK = null
+      await forgeEnvelopeAndCanary(server, kp)
+
+      const result = await migrateToV2(clientFor(server), {
+        listTrustedDevices: async () => [await deviceKeysFor(kp, 'test-device-id')],
+        getLegacyV1Sample: async () => null,
+      })
+
+      // Pinned deliberately: nothing local exists to verify against. Siblings
+      // reject the poisoned keyring in `followToV2`, so it cannot spread. If a
+      // signal the server does not author ever appears, this test is where it lands.
+      expect(result.outcome).toBe('migrated')
     })
   })
 
