@@ -4,6 +4,7 @@
 
 import { useAuth, useDatabase } from '@/contexts'
 import { useSignInModal } from '@/contexts/sign-in-modal-context'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   allExportGroupIds,
   exportGroups,
@@ -1155,11 +1156,10 @@ export default function PreferencesSettingsPage() {
                   </legend>
                   {exportGroups.map((group) => (
                     <label key={group.id} className="flex items-start gap-2 text-sm">
-                      <input
-                        type="checkbox"
+                      <Checkbox
                         className="mt-0.5"
                         checked={exportGroupIds.includes(group.id)}
-                        onChange={() => dispatch({ type: 'TOGGLE_EXPORT_GROUP', payload: group.id })}
+                        onCheckedChange={() => dispatch({ type: 'TOGGLE_EXPORT_GROUP', payload: group.id })}
                       />
                       <span>
                         {exportGroupLabels[group.id]}
