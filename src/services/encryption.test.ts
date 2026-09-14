@@ -492,11 +492,11 @@ const seedV2Account = async (
   extraDekIds: KeyId[] = [],
 ): Promise<void> => {
   const ak = await generateAK(true)
-  const { dek: dek0, wrappedKey: w0 } = await mintDEK(ak)
+  const { dek: dek0, wrappedKey: w0 } = await mintDEK(ak, '0')
   server.wrappedKeys.set('0', w0)
-  server.wrappedKeys.set('v1', await wrapDEK(legacyCK, ak))
+  server.wrappedKeys.set('v1', await wrapDEK(legacyCK, ak, 'v1'))
   for (const id of extraDekIds) {
-    const { wrappedKey } = await mintDEK(ak)
+    const { wrappedKey } = await mintDEK(ak, id)
     server.wrappedKeys.set(id, wrappedKey)
   }
   const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek0, testUserId, '0')
@@ -683,7 +683,7 @@ describe('encryption service (v2)', () => {
       expect(storedPrimaryKeyId).toBe('0')
       expect(server.metadata?.schemeVersion).toBe(2)
       // The staged DEK 0 unwraps under the stored AK.
-      const dek0 = await unwrapDEK(storedDEKs.get('0')!, storedAK!)
+      const dek0 = await unwrapDEK(storedDEKs.get('0')!, storedAK!, '0')
       expect(dek0.algorithm.name).toBe('AES-GCM')
     })
 
@@ -878,7 +878,7 @@ describe('encryption service (v2)', () => {
       const oldAK = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
       const newAK = await generateAK(true)
       for (const [keyId, wrapped] of [...server.wrappedKeys]) {
-        server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, true), newAK))
+        server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, keyId, true), newAK, keyId))
       }
       server.envelopes.set('test-device-id', await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
       server.metadata!.keyVersion += 1
@@ -899,7 +899,7 @@ describe('encryption service (v2)', () => {
       // Pre-fix this staged new-AK wrappings next to the old AK, and every
       // decode failed open to raw ciphertext until an unwrap-failed escalation.
       for (const keyId of ['0', 'v1']) {
-        expect(await unwrapDEK(storedDEKs.get(keyId)!, storedAK!).then(() => true)).toBe(true)
+        expect(await unwrapDEK(storedDEKs.get(keyId)!, storedAK!, keyId).then(() => true)).toBe(true)
       }
       expect(storedKeyVersion).toBe(2)
     })
@@ -971,7 +971,7 @@ describe('encryption service (v2)', () => {
       const attackerAK = await generateAK(true)
       for (const [keyId, wrapped] of [...server.wrappedKeys]) {
         void wrapped
-        server.wrappedKeys.set(keyId, await wrapDEK(await generateDEK(true), attackerAK))
+        server.wrappedKeys.set(keyId, await wrapDEK(await generateDEK(true), attackerAK, keyId))
       }
       server.envelopes.set('test-device-id', await wrapAK(attackerAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
       server.metadata!.keyVersion += 1
@@ -994,7 +994,7 @@ describe('encryption service (v2)', () => {
       expect(storedKeyringAnchor!.version).toBe(anchorVersion)
       // Bound to DEK "0"'s material, so it opens under the DEK "0" the local AK
       // yields — and under nothing else.
-      const dek0 = await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!)
+      const dek0 = await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!, initialKeyId)
       expect(await keyringAnchorOpens(storedKeyringAnchor!, dek0)).toBe(true)
     })
 
@@ -1032,7 +1032,7 @@ describe('encryption service (v2)', () => {
       const oldAK = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
       const newAK = await generateAK(true)
       for (const [keyId, wrapped] of [...server.wrappedKeys]) {
-        server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, true), newAK))
+        server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, keyId, true), newAK, keyId))
       }
       server.envelopes.set('test-device-id', await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
       server.metadata!.keyVersion += 1
@@ -1041,7 +1041,7 @@ describe('encryption service (v2)', () => {
 
       // Adopted, keyring staged, and the witness untouched — a rotation changes
       // the wrapping, never DEK "0"'s material, which is why this passes.
-      expect(await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!).then(() => true)).toBe(true)
+      expect(await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!, initialKeyId).then(() => true)).toBe(true)
       expect(storedKeyVersion).toBe(server.metadata!.keyVersion)
       expect(storedKeyringAnchor).toBe(anchorBefore)
     })
@@ -1066,17 +1066,18 @@ describe('encryption service (v2)', () => {
     })
 
     it('does not rewrite a current witness when the served DEK "0" is relabelled', async () => {
-      // AES-KW carries no key_id binding, so the server can serve an honest blob
-      // for a DIFFERENT key under key_id "0". It unwraps fine under the local
-      // AK, so a "re-mint whenever the witness disagrees with local state" rule
-      // would quietly repoint the witness at a key the server chose. Write-once
-      // is what makes that impossible.
+      // A served DEK "0" whose MATERIAL is not the witnessed one (the wrap AAD
+      // now blocks a byte-copy relabel of another row, THU-893, but an in-origin
+      // writer or a correctly-labelled substitute blob remains conceivable). A
+      // "re-mint whenever the witness disagrees with local state" rule would
+      // quietly repoint the witness at a key the server chose. Write-once is
+      // what makes that impossible.
       const { server, kp } = await establishedDevice()
       const anchorBefore = storedKeyringAnchor
       expect(anchorBefore).not.toBeNull()
 
       const ak = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
-      server.wrappedKeys.set(initialKeyId, await wrapDEK(await generateDEK(true), ak))
+      server.wrappedKeys.set(initialKeyId, await wrapDEK(await generateDEK(true), ak, initialKeyId))
       server.metadata!.keyVersion += 1
 
       await stageKeyring(clientFor(server)).catch(() => undefined)
@@ -1086,7 +1087,7 @@ describe('encryption service (v2)', () => {
 
     it('re-mints only when the stored witness format is superseded', async () => {
       const { server } = await establishedDevice()
-      const dek0 = await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!)
+      const dek0 = await unwrapDEK(storedDEKs.get(initialKeyId)!, storedAK!, initialKeyId)
       // A device carrying the previous on-disk format. It must re-mint from
       // local state rather than read as a substituted key, or an `anchorVersion`
       // bump would brick every device on every account.
@@ -1190,7 +1191,7 @@ describe('encryption service (v2)', () => {
       // Every key_id is re-wrapped and unwraps under the new stored AK.
       for (const keyId of ['0', 'v1', '1']) {
         expect(storedDEKs.has(keyId)).toBe(true)
-        const dek = await unwrapDEK(storedDEKs.get(keyId)!, storedAK!)
+        const dek = await unwrapDEK(storedDEKs.get(keyId)!, storedAK!, keyId)
         expect(dek.algorithm.name).toBe('AES-GCM')
       }
     })
@@ -1214,7 +1215,7 @@ describe('encryption service (v2)', () => {
       const akBefore = storedAK!
       const rawBefore = await crypto.subtle.exportKey(
         'raw',
-        await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, akBefore, true),
+        await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, akBefore, initialKeyId, true),
       )
 
       await rotateAccountKey(clientFor(server), {
@@ -1226,7 +1227,7 @@ describe('encryption service (v2)', () => {
       expect(storedAK).not.toBe(akBefore)
       const rawAfter = await crypto.subtle.exportKey(
         'raw',
-        await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, storedAK!, true),
+        await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, storedAK!, initialKeyId, true),
       )
       expect(uint8ArrayToBase64(new Uint8Array(rawAfter))).toBe(uint8ArrayToBase64(new Uint8Array(rawBefore)))
     })
@@ -1253,7 +1254,7 @@ describe('encryption service (v2)', () => {
         fixtureRecoveryKeyPair.ecdhPrivateKey,
         fixtureRecoveryKeyPair.mlkemSecretKey,
       )
-      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK)
+      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')
       expect(dek0.algorithm.name).toBe('AES-GCM')
     })
 
@@ -1389,7 +1390,7 @@ describe('encryption service (v2)', () => {
       // server now holds, which in turn unwraps the live keyring.
       const rkp = await deriveRecoveryKeyPairFromSeed(decodeRecoveryKey(newPhrase), server.metadata!.kdfSalt!)
       const recoveredAK = await unwrapAK(server.metadata!.recoveryWrappedAk!, rkp.ecdhPrivateKey, rkp.mlkemSecretKey)
-      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK)
+      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')
       expect(dek0.algorithm.name).toBe('AES-GCM')
     })
 
@@ -1426,7 +1427,7 @@ describe('encryption service (v2)', () => {
       // A fresh DEK became primary, and the whole keyring rides the new AK.
       expect(server.metadata?.primaryKeyId).toBe('1')
       for (const keyId of ['0', 'v1', '1']) {
-        const dek = await unwrapDEK(storedDEKs.get(keyId)!, storedAK!)
+        const dek = await unwrapDEK(storedDEKs.get(keyId)!, storedAK!, keyId)
         expect(dek.algorithm.name).toBe('AES-GCM')
       }
       // Revocation is silent: same phrase, same salt, nothing owed to the user.
@@ -1437,7 +1438,7 @@ describe('encryption service (v2)', () => {
         fixtureRecoveryKeyPair.ecdhPrivateKey,
         fixtureRecoveryKeyPair.mlkemSecretKey,
       )
-      expect(await unwrapDEK(server.wrappedKeys.get('1')!, recoveredAK)).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('1')!, recoveredAK, '1')).toBeDefined()
     })
 
     it('ignores a planted out-of-grammar key_id when allocating the new primary (THU-871)', async () => {
@@ -1470,7 +1471,7 @@ describe('encryption service (v2)', () => {
       // primary points at a key this device actually minted.
       expect(server.metadata?.primaryKeyId).toBe('1')
       expect(server.wrappedKeys.has(planted)).toBe(true)
-      expect(await unwrapDEK(server.wrappedKeys.get('1')!, storedAK!)).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('1')!, storedAK!, '1')).toBeDefined()
     })
 
     it('is not blocked by a planted key_id at the top of the grammar (THU-871)', async () => {
@@ -1495,7 +1496,7 @@ describe('encryption service (v2)', () => {
       // Allocated into the gap, well inside the grammar the server enforces.
       expect(server.metadata?.primaryKeyId).toBe('1')
       expect(isMintableKeyId(server.metadata!.primaryKeyId)).toBe(true)
-      expect(await unwrapDEK(server.wrappedKeys.get('1')!, storedAK!)).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('1')!, storedAK!, '1')).toBeDefined()
     })
 
     it('completes despite an unopenable keyring row, passing it through (THU-871)', async () => {
@@ -1509,7 +1510,7 @@ describe('encryption service (v2)', () => {
       await checkApprovalAndUnwrap(clientFor(server))
 
       // Wrapped under an AK nobody on this account holds.
-      const junk = await wrapDEK(await generateDEK(true), await generateAK(true))
+      const junk = await wrapDEK(await generateDEK(true), await generateAK(true), 'poison')
       server.wrappedKeys.set('poison', junk)
       const versionBefore = server.metadata!.keyVersion
 
@@ -1521,7 +1522,7 @@ describe('encryption service (v2)', () => {
       // the real keys moved to the new AK.
       expect(server.metadata!.keyVersion).toBe(versionBefore + 1)
       expect(server.metadata!.primaryKeyId).toBe('1')
-      expect(await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, storedAK!)).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get(initialKeyId)!, storedAK!, initialKeyId)).toBeDefined()
       // The junk row kept its original blob — passed through, not dropped and not
       // deleted, so it remains repairable by a device holding the old AK.
       expect(server.wrappedKeys.get('poison')).toBe(junk)
@@ -1589,7 +1590,7 @@ describe('encryption service (v2)', () => {
       expect(server.metadata?.schemeVersion).toBe(2)
 
       // Dual-read: the absorbed "v1" slot decrypts the legacy value end-to-end.
-      const v1Dek = await unwrapDEK(storedDEKs.get('v1')!, storedAK!)
+      const v1Dek = await unwrapDEK(storedDEKs.get('v1')!, storedAK!, 'v1')
       const plaintext = await decrypt(legacyValue, v1Dek)
       expect(plaintext).toBe('hello legacy')
 
@@ -1597,7 +1598,7 @@ describe('encryption service (v2)', () => {
       const rkp = await deriveRecoveryKeyPairFromSeed(decodeRecoveryKey(result.recoveryKey), server.metadata!.kdfSalt!)
       expect(server.metadata!.recoveryEcdhPublicKey).toBe(await exportPublicKey(rkp.ecdhPublicKey))
       const recoveredAK = await unwrapAK(server.metadata!.recoveryWrappedAk!, rkp.ecdhPrivateKey, rkp.mlkemSecretKey)
-      expect(await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK)).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')).toBeDefined()
     })
 
     it('covers this device from local keys even when the synced devices table is empty', async () => {
@@ -1712,7 +1713,7 @@ describe('encryption service (v2)', () => {
       })
 
       expect(result.outcome).toBe('migrated')
-      const v1Dek = await unwrapDEK(storedDEKs.get('v1')!, storedAK!)
+      const v1Dek = await unwrapDEK(storedDEKs.get('v1')!, storedAK!, 'v1')
       expect(await decrypt(legacyValue, v1Dek)).toBe('hello legacy')
     })
 

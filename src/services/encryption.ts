@@ -270,7 +270,7 @@ const getCanarySecret = async (httpClient: HttpClient): Promise<string> => {
   if (!ak) {
     throw new Error('Account key not found in IndexedDB')
   }
-  const dek0 = await unwrapDEK(await getWrappedDek0(httpClient), ak)
+  const dek0 = await unwrapDEK(await getWrappedDek0(httpClient), ak, initialKeyId)
   const { valid, canarySecret } = await verifyCanary(
     dek0,
     getUserId(),
@@ -529,7 +529,7 @@ const localDek0 = async (): Promise<CryptoKey | null> => {
   if (!ak || !wrapped) {
     return null
   }
-  return unwrapDEK(wrapped, ak).catch(() => null)
+  return unwrapDEK(wrapped, ak, initialKeyId).catch(() => null)
 }
 
 /**
@@ -544,11 +544,13 @@ const localDek0 = async (): Promise<CryptoKey | null> => {
  *
  * A CURRENT anchor is never rewritten — deliberately, and this is the subtle
  * part. "Re-mint whenever the anchor does not open under the local DEK `"0"`"
- * looks like a harmless self-heal and is not: AES-KW carries no key_id binding,
- * so a server can serve an honest blob for a DIFFERENT key relabelled as
- * `"0"`. It unwraps fine under the local AK, so `localDek0` would hand back the
- * wrong key material and the re-mint would quietly repoint the witness at a
- * key the server chose. Write-once is what makes that impossible.
+ * looks like a harmless self-heal and is not: when this was designed the DEK
+ * wrapping (then AES-KW) carried no key_id binding, so a server could serve an
+ * honest blob for a DIFFERENT key relabelled as `"0"`, it unwrapped fine, and a
+ * re-mint would have quietly repointed the witness at a key the server chose.
+ * `dekWrapAAD` (THU-893) now makes that relabel fail at unwrap, but write-once
+ * stays: it is what makes the witness trustworthy independent of the wrapping
+ * scheme, and DEK `"0"`'s material is immutable by invariant anyway.
  *
  * The cost of that choice is that a FOREIGN anchor — account A's, surviving on a
  * device now signed in as B because `clearLocalData` logs and continues when
@@ -606,7 +608,7 @@ const assertCandidateAKIsOurs = async (candidate: CryptoKey, keyring: FetchedKey
   if (!served) {
     throw new AKAnchorError('unopenable')
   }
-  const candidateDek0 = await unwrapDEK(served, candidate).catch(() => null)
+  const candidateDek0 = await unwrapDEK(served, candidate, initialKeyId).catch(() => null)
   if (!candidateDek0) {
     throw new AKAnchorError('unopenable')
   }
@@ -687,7 +689,7 @@ const keyringUnwrapsUnderLocalAK = async (keyring: FetchedKeyring): Promise<bool
   if (!probe) {
     return true
   }
-  return unwrapDEK(probe.wrapped_key, ak).then(
+  return unwrapDEK(probe.wrapped_key, ak, probe.key_id).then(
     () => true,
     () => false,
   )
@@ -823,7 +825,7 @@ export const completeFirstDeviceSetup = async (httpClient: HttpClient): Promise<
   // Extractable only transiently — it must be wrapped into the two envelopes.
   const extractableAK = await generateAK(true)
 
-  const { dek, wrappedKey } = await mintDEK(extractableAK)
+  const { dek, wrappedKey } = await mintDEK(extractableAK, initialKeyId)
   const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek, getUserId(), initialKeyId)
   const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
 
@@ -1058,7 +1060,7 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
   // Verify the recovered AK against the account: unwrap DEK '0' and decrypt the
   // canary. Catches a recovery slot that no longer matches the live keyring.
   const { wrapped_key: wrappedDEK0 } = await fetchWrappedKey(httpClient, initialKeyId)
-  const dek0 = await unwrapDEK(wrappedDEK0, ak).catch(() => null)
+  const dek0 = await unwrapDEK(wrappedDEK0, ak, initialKeyId).catch(() => null)
   if (!dek0) {
     throw new ValidationError('Invalid recovery key')
   }
@@ -1296,14 +1298,15 @@ const runAKRotation = async (
       `[e2ee] keyring rows could not be re-wrapped and were passed through unchanged: ${strandedKeyIds.join(', ')}`,
     )
   }
-  const dek0 = await unwrapDEK(dek0Wrapped, newAK)
+  const dek0 = await unwrapDEK(dek0Wrapped, newAK, initialKeyId)
 
   // The DEK rotation half, when this rotation is also one (revocation). Minted
   // under the NEW AK, so it needs no re-wrap and can never be stranded under a
   // stale AK, and it rides the rotate transaction so a failure adds no keyring
   // row at all — retrying a revocation cannot grow the keyring (THU-871).
-  const newPrimaryKey: WrappedKeyEntry | undefined = opts.mintNewPrimary
-    ? { keyId: nextPrimaryKeyId(keys.map((key) => key.key_id)), wrappedKey: (await mintDEK(newAK)).wrappedKey }
+  const mintedKeyId = opts.mintNewPrimary ? nextPrimaryKeyId(keys.map((key) => key.key_id)) : null
+  const newPrimaryKey: WrappedKeyEntry | undefined = mintedKeyId
+    ? { keyId: mintedKeyId, wrappedKey: (await mintDEK(newAK, mintedKeyId)).wrappedKey }
     : undefined
 
   // New-AK envelope for every live trusted device, minus explicit exclusions
@@ -1665,8 +1668,8 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
   const recovery = await mintRecoveryPlan()
   const newAK = await generateAK(true)
 
-  const { dek: dek0, wrappedKey: wrappedDek0 } = await mintDEK(newAK)
-  const wrappedV1 = await wrapDEK(legacyCK, newAK)
+  const { dek: dek0, wrappedKey: wrappedDek0 } = await mintDEK(newAK, initialKeyId)
+  const wrappedV1 = await wrapDEK(legacyCK, newAK, legacyKeyId)
 
   const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek0, getUserId(), initialKeyId)
   const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
@@ -1849,7 +1852,7 @@ const runContinuityCheck = async (
     // No `"v1"` slot (account never had legacy data) — nothing to check.
     return
   }
-  const v1Dek = await unwrapDEK(wrappedV1, ak)
+  const v1Dek = await unwrapDEK(wrappedV1, ak, legacyKeyId)
   if (!(await ckOpensLegacySample(v1Dek, sample))) {
     throw new Error('E2EE continuity check failed — the staged keyring could not decrypt legacy data')
   }

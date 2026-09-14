@@ -79,10 +79,12 @@ export const mintKeyringAnchor = async (dek0: CryptoKey): Promise<KeyringAnchor>
  *
  * A stale on-disk FORMAT is distinguishable, and is the one case a caller may
  * act on by re-minting: it shows up as a version mismatch rather than as a
- * failed decrypt. Note that "does not open" alone must never trigger a re-mint —
- * AES-KW carries no key_id binding, so a server can serve an honest blob for a
- * different key under `key_id "0"`, and re-minting on disagreement would let it
- * repoint the witness at a key it chose.
+ * failed decrypt. Note that "does not open" alone must never trigger a re-mint.
+ * When this was designed the DEK wrapping carried no key_id binding, so a server
+ * could serve an honest blob for a different key under `key_id "0"` and a
+ * re-mint on disagreement would repoint the witness at a key it chose; the wrap
+ * AAD (`dekWrapAAD`, THU-893) now blocks that relabel, but the rule stays — the
+ * witness must not be rewritable on any signal the server can induce.
  *
  * Returns `false` rather than throwing on a wrong key: an authentication-tag
  * failure is the expected negative result here, not an exception. Mirrors

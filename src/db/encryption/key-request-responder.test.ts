@@ -88,7 +88,7 @@ const setupKeyring = async (keyIds: KeyId[], primary: KeyId) => {
   await storeAK(ak)
   const deks = new Map<KeyId, { dek: CryptoKey; wrappedKey: string }>()
   for (const keyId of keyIds) {
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, keyId)
     await storeDEK(keyId, minted.wrappedKey)
     deks.set(keyId, minted)
   }
@@ -170,7 +170,7 @@ describe('prime — startup staging + key_version polling', () => {
     // Server-side AK rotation: the SAME DEK re-wrapped under a NEW AK (mirrors
     // rotateAccountKey: unwrap extractable under old AK, wrap under new), key_version 2.
     const newAK = await generateAK()
-    const rewrappedDEK0 = await wrapDEK(await unwrapDEK(deks.get('0')!.wrappedKey, ak, true), newAK)
+    const rewrappedDEK0 = await wrapDEK(await unwrapDEK(deks.get('0')!.wrappedKey, ak, '0', true), newAK, '0')
 
     const responder = createKeyRequestResponder({
       stageKeyring: failIfCalled('stageKeyring'),
@@ -257,7 +257,7 @@ describe('key-request handling (integration with the real codec)', () => {
     // before the responder is created (the keyring itself stays empty at
     // creation time, so `prime()` no-ops), then stage everything afterward.
     const newAK = await generateAK()
-    const minted1 = await mintDEK(newAK)
+    const minted1 = await mintDEK(newAK, '1')
 
     const refresh = mock(async () => {
       await storeAK(newAK)

@@ -169,14 +169,14 @@ describe('non-destructive v1→v2 upgrade', () => {
 })
 
 describe('storeAK / getAK', () => {
-  it('round-trips the AK as a non-extractable AES-KW CryptoKey usable as the keyring gate', async () => {
+  it('round-trips the AK as a non-extractable AES-GCM CryptoKey usable as the keyring gate', async () => {
     const ak = await generateAK()
     await storeAK(ak)
 
     const stored = await getAK()
-    expect(stored?.algorithm.name).toBe('AES-KW')
+    expect(stored?.algorithm.name).toBe('AES-GCM')
     expect(stored?.extractable).toBe(false)
-    expect(typeof (await wrapDEK(await generateDEK(true), stored as CryptoKey))).toBe('string')
+    expect(typeof (await wrapDEK(await generateDEK(true), stored as CryptoKey, '0'))).toBe('string')
   })
 
   it('returns null when no AK is stored', async () => {
@@ -186,7 +186,7 @@ describe('storeAK / getAK', () => {
 
 describe('DEK keyring entries', () => {
   it('stores DEKs as wrapped base64 strings, not CryptoKeys', async () => {
-    const wrapped = await wrapDEK(await generateDEK(true), await generateAK())
+    const wrapped = await wrapDEK(await generateDEK(true), await generateAK(), '0')
     await storeDEK('0', wrapped)
     expect(await getDEK('0')).toBe(wrapped)
     expect(typeof (await readRaw('thunderbolt_dek_0'))).toBe('string')

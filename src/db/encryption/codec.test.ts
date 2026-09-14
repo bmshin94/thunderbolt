@@ -9,11 +9,13 @@ import {
   clearAllKeys,
   encrypt,
   generateAK,
+  generateDEK,
   getPrimaryKeyId,
   mintDEK,
   storeAK,
   storeDEK,
   storePrimaryKeyId,
+  wrapDEK,
 } from '@/crypto'
 import { encodeAAD, encPrefix, encV2Prefix, legacyKeyId, type KeyId } from '@shared/e2ee-types'
 import { formatWireValue, isV2EncryptedValue, parseWireValue } from './wire-format'
@@ -77,7 +79,7 @@ const setupKeyring = async (keyIds: KeyId[], primary: KeyId) => {
   await storeAK(ak)
   const deks = new Map<KeyId, { dek: CryptoKey; wrappedKey: string }>()
   for (const keyId of keyIds) {
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, keyId)
     await storeDEK(keyId, minted.wrappedKey)
     deks.set(keyId, minted)
   }
@@ -147,7 +149,7 @@ describe('encode', () => {
     // encrypting under "v1" or leaking cleartext.
     const ak = await generateAK()
     await storeAK(ak)
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, legacyKeyId)
     await storeDEK(legacyKeyId, minted.wrappedKey)
     await expect(codec.encode('x', ctx)).rejects.toThrow('refusing to upload plaintext')
   })
@@ -161,8 +163,8 @@ describe('encode', () => {
     // every future write onto the decrypt-only legacy CK.
     const ak = await generateAK()
     await storeAK(ak)
-    await storeDEK('0', (await mintDEK(ak)).wrappedKey)
-    await storeDEK(legacyKeyId, (await mintDEK(ak)).wrappedKey)
+    await storeDEK('0', (await mintDEK(ak, '0')).wrappedKey)
+    await storeDEK(legacyKeyId, (await mintDEK(ak, legacyKeyId)).wrappedKey)
     await plantRawPrimaryKeyId(legacyKeyId)
     resetCodecState()
 
@@ -175,7 +177,7 @@ describe('encode', () => {
   it("falls back to key_id '0' when no primary pointer is set but DEK 0 exists", async () => {
     const ak = await generateAK()
     await storeAK(ak)
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, '0')
     await storeDEK('0', minted.wrappedKey)
 
     const encoded = await codec.encode('fallback', ctx)
@@ -221,7 +223,7 @@ describe('decode — dual-read matrix', () => {
     const { ak } = await setupKeyring(['0'], '0')
     // The "v1" slot is an ordinary AES-GCM DEK; a v1 value was written with it
     // and no AAD.
-    const legacy = await mintDEK(ak)
+    const legacy = await mintDEK(ak, legacyKeyId)
     await storeDEK(legacyKeyId, legacy.wrappedKey)
     const { iv, ciphertext } = await encrypt('legacy secret', legacy.dek)
     const v1Value = `${encPrefix}${iv}:${ciphertext}`
@@ -264,11 +266,13 @@ describe('decode — AAD tamper negatives', () => {
   it('fails GCM when the wire key_id is swapped (key_id AAD dimension)', async () => {
     const ak = await generateAK()
     await storeAK(ak)
-    const minted = await mintDEK(ak)
-    // The SAME DEK staged under both ids isolates the key_id AAD dimension from
-    // a plain key mismatch.
-    await storeDEK('0', minted.wrappedKey)
-    await storeDEK('1', minted.wrappedKey)
+    // The SAME DEK material staged under both ids isolates the wire key_id's
+    // data-AAD dimension from a plain key mismatch. Each id gets its own wrap
+    // (the wrap itself binds key_id since THU-893, so one blob cannot serve two
+    // ids) — the MATERIAL being shared is what keeps this a data-AAD test.
+    const dek = await generateDEK(true)
+    await storeDEK('0', await wrapDEK(dek, ak, '0'))
+    await storeDEK('1', await wrapDEK(dek, ak, '1'))
     await storePrimaryKeyId('0')
 
     const encoded = await codec.encode('secret', ctx)
@@ -311,7 +315,7 @@ describe('keys-sync channel protocol', () => {
 
   it("unknown key_id: posts key-request (unknown-key) and resolves after 'key-staged'", async () => {
     const { ak } = await setupKeyring(['0'], '0')
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, '1')
     const aad = encodeAAD(ctx.table, ctx.column, ctx.rowId, '1')
     const { iv, ciphertext } = await encrypt('future value', minted.dek, aad)
     const wireValue = formatWireValue('1', iv, ciphertext)
@@ -329,7 +333,7 @@ describe('keys-sync channel protocol', () => {
   it("a not-yet-staged v1 slot triggers a key-request for 'v1' and self-heals", async () => {
     const { ak } = await setupKeyring(['0'], '0')
     // Produce a legacy v1 value, but do NOT stage the "v1" slot yet.
-    const legacy = await mintDEK(ak)
+    const legacy = await mintDEK(ak, legacyKeyId)
     const { iv, ciphertext } = await encrypt('legacy secret', legacy.dek)
     const v1Value = `${encPrefix}${iv}:${ciphertext}`
 
@@ -348,7 +352,7 @@ describe('keys-sync channel protocol', () => {
     // arrives wrapped under the NEW AK.
     await setupKeyring(['0'], '0')
     const newAK = await generateAK()
-    const minted = await mintDEK(newAK)
+    const minted = await mintDEK(newAK, '1')
     await storeDEK('1', minted.wrappedKey)
 
     const aad = encodeAAD(ctx.table, ctx.column, ctx.rowId, '1')
@@ -369,7 +373,7 @@ describe('keys-sync channel protocol', () => {
   it('still fails open (raw value) when the staged key never arrives and the retry fails', async () => {
     await setupKeyring(['0'], '0')
     const otherAK = await generateAK()
-    const minted = await mintDEK(otherAK)
+    const minted = await mintDEK(otherAK, '9')
     const aad = encodeAAD(ctx.table, ctx.column, ctx.rowId, '9')
     const { iv, ciphertext } = await encrypt('unreachable', minted.dek, aad)
     const wireValue = formatWireValue('9', iv, ciphertext)
@@ -384,7 +388,7 @@ describe('keys-sync channel protocol', () => {
 
   it('coalesces concurrent decodes of the same unknown key_id into a single key-request', async () => {
     const { ak } = await setupKeyring(['0'], '0')
-    const minted = await mintDEK(ak)
+    const minted = await mintDEK(ak, '1')
     const encryptUnder1 = async (plaintext: string, rowId: string) => {
       const aad = encodeAAD(ctx.table, ctx.column, rowId, '1')
       const { iv, ciphertext } = await encrypt(plaintext, minted.dek, aad)

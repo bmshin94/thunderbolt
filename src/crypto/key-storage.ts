@@ -206,7 +206,8 @@ export const getKeyPair = async (): Promise<StoredKeyPair | null> => {
 }
 
 // =============================================================================
-// AK (non-extractable AES-KW CryptoKey) + wrapped DEK keyring (base64 blobs)
+// AK (non-extractable wrap-only AES-GCM CryptoKey) + wrapped DEK keyring
+// (base64 blobs)
 // =============================================================================
 
 /** Store the account key in IndexedDB. */
@@ -228,9 +229,9 @@ export const getAK = async (): Promise<CryptoKey | null> => getValue<CryptoKey>(
 export const getLegacyCK = async (): Promise<CryptoKey | null> => getValue<CryptoKey>(legacyCkId)
 
 /**
- * Store one DEK as its wrapped base64 AES-KW blob (NOT a CryptoKey). The
- * SharedWorker reads wrapped blobs + the AK and unwraps on demand, keeping the
- * AK as the keyring gate.
+ * Store one DEK as its wrapped base64 blob (NOT a CryptoKey — see `wrapDEK` for
+ * the format, which binds the key_id as AAD). The SharedWorker reads wrapped
+ * blobs + the AK and unwraps on demand, keeping the AK as the keyring gate.
  */
 export const storeDEK = async (keyId: KeyId, wrappedBase64: string): Promise<void> =>
   putValue(dekEntryId(keyId), wrappedBase64)

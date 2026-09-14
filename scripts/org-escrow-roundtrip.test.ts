@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { encPrefix, encV2Prefix, encodeAAD, legacyKeyId, orgEnvelopeVersion, orgEscrowHkdfInfo } from '../shared/e2ee-types'
+import { dekWrapAAD, encPrefix, encV2Prefix, encodeAAD, legacyKeyId, orgEnvelopeVersion, orgEscrowHkdfInfo } from '../shared/e2ee-types'
 import { decryptCellValue, parseOrgEnvelope, unwrapEscrowedAK, unwrapKeyring } from './org-escrow-decrypt'
 import { generateEscrowKeypair } from './org-escrow-keygen'
 
@@ -47,12 +47,22 @@ const wrapAkForOrg = async (ak: CryptoKey, operatorPublicKeyBase64: string): Pro
 }
 
 const generateAk = (): Promise<CryptoKey> =>
-  crypto.subtle.generateKey({ name: 'AES-KW', length: 256 }, true, ['wrapKey', 'unwrapKey']) as Promise<CryptoKey>
+  crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['wrapKey', 'unwrapKey']) as Promise<CryptoKey>
 
-const mintWrappedDek = async (ak: CryptoKey): Promise<{ dek: CryptoKey; wrappedKey: string }> => {
+const mintWrappedDek = async (ak: CryptoKey, keyId: string): Promise<{ dek: CryptoKey; wrappedKey: string }> => {
   const dek = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
-  const wrappedKey = toBase64(new Uint8Array(await crypto.subtle.wrapKey('raw', dek, ak, 'AES-KW')))
-  return { dek, wrappedKey }
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const wrapped = new Uint8Array(
+    await crypto.subtle.wrapKey('raw', dek, ak, {
+      name: 'AES-GCM',
+      iv,
+      additionalData: dekWrapAAD(keyId) as BufferSource,
+    }),
+  )
+  const blob = new Uint8Array(iv.length + wrapped.length)
+  blob.set(iv, 0)
+  blob.set(wrapped, iv.length)
+  return { dek, wrappedKey: toBase64(blob) }
 }
 
 const encryptV2 = async (plaintext: string, dek: CryptoKey, aad: Uint8Array, keyId: string): Promise<string> => {
@@ -81,7 +91,7 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
 
     const ak = await generateAk()
     const envelope = await wrapAkForOrg(ak, keypair.publicKey)
-    const primary = await mintWrappedDek(ak)
+    const primary = await mintWrappedDek(ak, '0')
 
     const ctx = { table: 'tasks', column: 'item', rowId: 'row-123' }
     const wire = await encryptV2('the secret task', primary.dek, encodeAAD(ctx.table, ctx.column, ctx.rowId, '0'), '0')
@@ -97,7 +107,7 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
     const keypair = await generateEscrowKeypair()
     const ak = await generateAk()
     const envelope = await wrapAkForOrg(ak, keypair.publicKey)
-    const legacy = await mintWrappedDek(ak)
+    const legacy = await mintWrappedDek(ak, legacyKeyId)
 
     const wire = await encryptV1('legacy plaintext', legacy.dek)
 
@@ -115,9 +125,9 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
     const keypair = await generateEscrowKeypair()
     const ak = await generateAk()
     const envelope = await wrapAkForOrg(ak, keypair.publicKey)
-    const primary = await mintWrappedDek(ak)
+    const primary = await mintWrappedDek(ak, '0')
     // Wrapped under a different AK: the shape of a planted or stranded row.
-    const stranded = await mintWrappedDek(await generateAk())
+    const stranded = await mintWrappedDek(await generateAk(), '7')
 
     const ctx = { table: 'tasks', column: 'item', rowId: 'row-123' }
     const aad = encodeAAD(ctx.table, ctx.column, ctx.rowId, '0')
@@ -136,11 +146,32 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
     expect(await decryptCellValue(wire, deks, ctx)).toEqual({ plaintext: 'still recoverable', wasEncrypted: true })
   })
 
+  test('a row relabelled under a different key_id is skipped, not unwrapped (THU-893)', async () => {
+    // The wrap binds key_id as AAD, so serving a genuine blob under another id
+    // (the relabelling attack) fails the auth tag in the operator tool exactly
+    // as it does in the client.
+    const keypair = await generateEscrowKeypair()
+    const ak = await generateAk()
+    const envelope = await wrapAkForOrg(ak, keypair.publicKey)
+    const v1Row = await mintWrappedDek(ak, legacyKeyId)
+
+    const recoveredAk = await unwrapEscrowedAK(parseOrgEnvelope(envelope), keypair.privateKey)
+    const deks = await unwrapKeyring(
+      [
+        { keyId: legacyKeyId, wrappedKey: v1Row.wrappedKey },
+        { keyId: '1', wrappedKey: v1Row.wrappedKey },
+      ],
+      recoveredAk,
+    )
+
+    expect([...deks.keys()]).toEqual([legacyKeyId])
+  })
+
   test('a cell written under a skipped key_id still fails, naming that key_id', async () => {
     const keypair = await generateEscrowKeypair()
     const ak = await generateAk()
     const envelope = await wrapAkForOrg(ak, keypair.publicKey)
-    const stranded = await mintWrappedDek(await generateAk())
+    const stranded = await mintWrappedDek(await generateAk(), '7')
 
     const ctx = { table: 'tasks', column: 'item', rowId: 'row-123' }
     const wire = await encryptV2('unreachable', stranded.dek, encodeAAD(ctx.table, ctx.column, ctx.rowId, '7'), '7')
@@ -180,7 +211,7 @@ describe('org escrow round trip (keygen → frontend wrap → decrypt tool)', ()
     const keypair = await generateEscrowKeypair()
     const ak = await generateAk()
     const envelope = await wrapAkForOrg(ak, keypair.publicKey)
-    const primary = await mintWrappedDek(ak)
+    const primary = await mintWrappedDek(ak, '0')
 
     const wire = await encryptV2('bound value', primary.dek, encodeAAD('tasks', 'item', 'row-123', '0'), '0')
 

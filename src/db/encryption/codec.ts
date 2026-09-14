@@ -234,7 +234,7 @@ const resolveDEK = async (keyId: KeyId): Promise<DekResolution> => {
     return { failure: 'unknown-key' }
   }
   try {
-    const dek = await unwrapDEK(wrapped, ak)
+    const dek = await unwrapDEK(wrapped, ak, keyId)
     dekCache.set(keyId, dek)
     e2eeSetupComplete = true
     return { dek }

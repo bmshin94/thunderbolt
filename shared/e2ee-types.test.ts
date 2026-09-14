@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   canaryAAD,
+  dekWrapAAD,
   challengeOperations,
   ecdsaKeyAlgorithm,
   ecdsaSignAlgorithm,
@@ -105,6 +106,22 @@ describe('encodeAAD', () => {
   test('field boundaries are unambiguous (no cross-field collision)', () => {
     // "ab|c" vs "a|bc" must differ despite equal concatenation without a separator.
     expect(Array.from(encodeAAD('ab', 'c', 'r', '0'))).not.toEqual(Array.from(encodeAAD('a', 'bc', 'r', '0')))
+  })
+})
+
+describe('dekWrapAAD', () => {
+  test('pins exact bytes — a wire contract, not an implementation detail', () => {
+    // "__kw" + 0x1f + key_id. Changing this silently orphans every wrapped DEK.
+    expect(Array.from(dekWrapAAD('0'))).toEqual([95, 95, 107, 119, 31, 48])
+    expect(Array.from(dekWrapAAD('v1'))).toEqual([95, 95, 107, 119, 31, 118, 49])
+  })
+
+  test('binds the key_id — a relabelled blob cannot share an AAD (THU-893)', () => {
+    expect(Array.from(dekWrapAAD('1'))).not.toEqual(Array.from(dekWrapAAD('v1')))
+  })
+
+  test('is disjoint from every encodeAAD value (the "__kw" prefix is not a table name)', () => {
+    expect(Array.from(dekWrapAAD('0'))).not.toEqual(Array.from(encodeAAD('__kw', '', '', '0')))
   })
 })
 

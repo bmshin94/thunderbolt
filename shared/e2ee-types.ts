@@ -98,7 +98,7 @@ export const legacyKeyId: KeyId = 'v1'
 /** One wrapped DEK as stored server-side and staged into IndexedDB for the worker. */
 export type WrappedKeyEntry = {
   keyId: KeyId
-  /** Base64 AES-KW(DEK) under the current AK. */
+  /** Base64(`iv ‖ AES-GCM(DEK)`) under the current AK, `dekWrapAAD(keyId)` bound as AAD. */
   wrappedKey: string
 }
 
@@ -241,6 +241,25 @@ export const encodeAAD = (table: string, column: string, rowId: string, keyId: K
  * this helper, never inline, or verification silently fails across devices.
  */
 export const canaryAAD = (userId: string, keyId: KeyId): Uint8Array => encodeAAD('__meta', 'canary', userId, keyId)
+
+/**
+ * AAD binding a wrapped DEK to its `key_id` (THU-893). A keyring row's blob is
+ * AES-GCM-wrapped under the AK with this AAD, so the label the key was CREATED
+ * under and the label it is USED as must agree — enforced by the cipher, on
+ * every device, with no local state. Without it (the old AES-KW wrapping carried
+ * no AAD) a malicious server could serve the account's own genuine `"v1"` blob a
+ * second time under a mintable key_id and point `primary_key_id` at the copy:
+ * every gate passed, and new writes were sealed under the legacy v1 CK — the one
+ * key that never rotates, that revocation exempts, and that every v1-era device
+ * and pre-migration recovery phrase can open.
+ *
+ * THE ONE RULE THAT MAKES IT WORK: the unwrap-side AAD must be built from the
+ * key_id the CLIENT is resolving (the row label it trusts), never from any
+ * separately server-supplied field — otherwise the server supplies the matching
+ * AAD and the binding is void. The context prefix keeps this AAD disjoint from
+ * every `encodeAAD` value (those never start with `__kw`).
+ */
+export const dekWrapAAD = (keyId: KeyId): Uint8Array => utf8.encode(`__kw${payloadSeparator}${keyId}`)
 
 // =============================================================================
 // Challenge-response — ECDSA P-256 over nonce ‖ operation ‖ device_id

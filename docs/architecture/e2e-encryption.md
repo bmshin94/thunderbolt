@@ -30,7 +30,7 @@ The v1 → v2 rollout is a **hard cutover** guarded by the app-version gate (`cr
 | Concept                  | Description                                                                                                                                                                     |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Device key pair**      | Each device generates an **ECDH P-256** key pair and an **ML-KEM-768** key pair. Private keys never leave the device. The ML-KEM secret is encrypted at rest (self-ECDH → HKDF). |
-| **Account Key (AK)**     | An **AES-256** key with `wrapKey`/`unwrapKey` usages **only** — it never encrypts data; it is pure access control over the keyring. Randomly generated, never derived, so it can be rotated without the user's phrase. |
+| **Account Key (AK)**     | An **AES-256-GCM** key with `wrapKey`/`unwrapKey` usages **only** — it never encrypts data; it is pure access control over the keyring. GCM rather than AES-KW so each wrap can bind the DEK's `key_id` as AAD (THU-893). Randomly generated, never derived, so it can be rotated without the user's phrase. |
 | **DEK keyring**          | Versioned **AES-256-GCM** Data Encryption Keys (`key_id` `"0"`, `"1"`, …). Exactly one is `primary` (encrypts new writes); older DEKs are retained forever for reads. A `key_id` is an unpadded decimal counter of at most 15 digits (`keyIdPattern`) — bounded so the "next id" arithmetic stays exact, see [Minting a DEK](#minting-a-dek). |
 | **`"v1"` slot**          | A reserved, read-only DEK slot holding the **absorbed legacy CK** from a migrated account. Decrypts legacy `__enc:<iv>:<ct>` rows (no AAD) forever. Never encrypts. See migration. |
 | **Device envelope**      | The **AK** wrapped for one device via a hybrid ECDH + ML-KEM envelope. (The stored column is still named `wrapped_ck` for wire compatibility — it carries the AK.)             |
@@ -52,7 +52,7 @@ recovery keypair (ECDH-P256 + ML-KEM-768) — public half stored server-side
         ▲  hybrid envelope, alongside one per device
         │
        AK (Account Key, AES-256, wrapKey/unwrapKey only — randomly generated)
-        │  AES-KW wraps ▼
+        │  AES-GCM wraps, key_id bound as AAD ▼
    DEK keyring (versioned, AES-256-GCM)
         ├─ key_id "0"   (primary — encrypts new writes)
         ├─ key_id "1"…  (older DEK versions — retained for reads)
@@ -83,7 +83,9 @@ The re-wrap path stays deliberately permissive about ids that *already* exist (`
 
 The reserved `"v1"` slot is the reason this matters. It sits outside the grammar deliberately (`isMintableKeyId(legacyKeyId) === false`) because it is **decrypt-only**: it never rotates, revocation never re-wraps it, and the v1 recovery mnemonic *was* that key, so anyone holding an old phrase or retired device can open anything written under it. A pointer at `"v1"` would therefore produce well-formed, AAD-bound ciphertext that is nonetheless outside the hierarchy revocation controls.
 
-What the client cannot do is verify that a *grammar-valid* pointer is the newest one — the canary, the one artifact a server cannot forge, is deliberately bound to DEK `"0"` for the life of the account, so it attests nothing about which DEK is primary. Authenticating the pointer would mean signing the keyring.
+The grammar constrains only the pointer's *label*, so the label had to be bound to the key material too: a server could otherwise serve the account's own `"v1"` blob a second time under a mintable id (`"1"`) and point the primary at the copy — an entirely honest-looking pointer whose DEK is the legacy CK (THU-893). That is closed in the wrapping itself: `wrapDEK` binds the `key_id` into the wrapped blob as AAD (`dekWrapAAD` in `shared/e2ee-types.ts`), and `unwrapDEK` builds the AAD from the key_id the client is resolving — never from a separately server-supplied field — so a blob served under any other label fails the auth tag. A relabelled primary is therefore adopted as a pointer (it is grammar-valid) but its DEK never unwraps: `codec.encode` fails closed and the upload retries, rather than sealing anything under the legacy CK.
+
+What the client cannot do is verify that a *grammar-valid* pointer is the newest one — the canary, the one artifact a server cannot forge, is deliberately bound to DEK `"0"` for the life of the account, so it attests nothing about which DEK is primary. Authenticating the pointer would mean signing the keyring — and with the `key_id → material` half already enforced by the wrap AAD, what such a signature must add is *freshness*: proof the pointer is current, not merely well-formed and honestly labelled (THU-890).
 
 ### Adopting an AK from the server
 
@@ -93,7 +95,7 @@ So adoption is gated on a **device-local witness to DEK `"0"`'s key material** (
 
 Three things make this work, and each is easy to get wrong:
 
-- **It survives legitimate rotations.** DEK `"0"`'s *material* is immutable for the life of a v2 account: bootstrap and the v1→v2 upgrade each mint it once, and every AK rotation **re-wraps the same key**. So a real rotation still opens the witness. This is also why the witness is a ciphertext *under* the key rather than a copy of its wrapping — a wrapping changes on every rotation, so it could never be written once, and AES-KW carries no `key_id` binding, so a server can relabel one blob as another id and repoint a witness that tracked wrappings.
+- **It survives legitimate rotations.** DEK `"0"`'s *material* is immutable for the life of a v2 account: bootstrap and the v1→v2 upgrade each mint it once, and every AK rotation **re-wraps the same key**. So a real rotation still opens the witness. This is also why the witness is a ciphertext *under* the key rather than a copy of its wrapping — a wrapping changes on every rotation, so it could never be written once (and when this was designed the wrapping carried no `key_id` binding, so a relabelled blob could repoint a witness that tracked wrappings; the wrap AAD closed that, but the write-once rule never rested on it).
 - **It is minted from local state, never from a served keyring.** The check skips when there is no witness, so if the mint read the served keyring a server could simply omit `key_id "0"` forever and no device would ever have one. An established device that has an AK but no witness and nothing local to mint from therefore **refuses** rather than skipping.
 - **It is write-once.** A current witness is never rewritten, only replaced when its own on-disk format version is superseded. "Re-mint whenever it disagrees with local state" looks like a harmless self-heal and is the relabelling hole above.
 

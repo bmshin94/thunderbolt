@@ -64,9 +64,9 @@ describe('exportMlKemPublicKey / importMlKemPublicKey', () => {
 })
 
 describe('generateAK', () => {
-  it('generates a non-extractable AES-KW key with wrap/unwrap usages only', async () => {
+  it('generates a non-extractable AES-GCM key with wrap/unwrap usages only', async () => {
     const ak = await generateAK()
-    expect(ak.algorithm.name).toBe('AES-KW')
+    expect(ak.algorithm.name).toBe('AES-GCM')
     expect(ak.extractable).toBe(false)
     expect([...ak.usages].sort()).toEqual(['unwrapKey', 'wrapKey'])
   })
@@ -94,18 +94,18 @@ describe('generateDEK', () => {
 })
 
 describe('reimportAsNonExtractable', () => {
-  it('converts an extractable AK to a non-extractable AES-KW key', async () => {
+  it('converts an extractable AK to a non-extractable AES-GCM key', async () => {
     const nonExtractable = await reimportAsNonExtractable(await generateAK(true))
     expect(nonExtractable.extractable).toBe(false)
-    expect(nonExtractable.algorithm.name).toBe('AES-KW')
+    expect(nonExtractable.algorithm.name).toBe('AES-GCM')
     expect([...nonExtractable.usages].sort()).toEqual(['unwrapKey', 'wrapKey'])
   })
 
   it('reimported AK unwraps a DEK wrapped by the original', async () => {
     const extractableAK = await generateAK(true)
     const dek = await generateDEK(true)
-    const wrapped = await wrapDEK(dek, extractableAK)
-    const unwrapped = await unwrapDEK(wrapped, await reimportAsNonExtractable(extractableAK))
+    const wrapped = await wrapDEK(dek, extractableAK, '0')
+    const unwrapped = await unwrapDEK(wrapped, await reimportAsNonExtractable(extractableAK), '0')
     expect(unwrapped.algorithm.name).toBe('AES-GCM')
   })
 })
@@ -124,7 +124,7 @@ describe('wrapDEK / unwrapDEK', () => {
     const dek = await generateDEK(true)
     const encrypted = await encrypt('dek round trip', dek)
 
-    const unwrapped = await unwrapDEK(await wrapDEK(dek, ak), ak)
+    const unwrapped = await unwrapDEK(await wrapDEK(dek, ak, '0'), ak, '0')
     expect(unwrapped.extractable).toBe(false)
     expect([...unwrapped.usages].sort()).toEqual(['decrypt', 'encrypt'])
     expect(await decrypt(encrypted, unwrapped)).toBe('dek round trip')
@@ -133,25 +133,47 @@ describe('wrapDEK / unwrapDEK', () => {
   it('fails to unwrap with a different AK', async () => {
     const ak1 = await generateAK()
     const ak2 = await generateAK()
-    const wrapped = await wrapDEK(await generateDEK(true), ak1)
-    await expect(unwrapDEK(wrapped, ak2)).rejects.toThrow('Failed to unwrap DEK')
+    const wrapped = await wrapDEK(await generateDEK(true), ak1, '0')
+    await expect(unwrapDEK(wrapped, ak2, '0')).rejects.toThrow('Failed to unwrap DEK')
   })
 
   it('fails to wrap a non-extractable DEK', async () => {
     const ak = await generateAK()
     const dek = await generateDEK()
-    await expect(wrapDEK(dek, ak)).rejects.toThrow('Failed to wrap DEK')
+    await expect(wrapDEK(dek, ak, '0')).rejects.toThrow('Failed to wrap DEK')
+  })
+
+  /**
+   * THU-893 — the key_id is bound into the blob as AAD, so a keyring row served
+   * under any OTHER key_id fails on the auth tag. This is what makes the
+   * relabelling attack (the account's own "v1" blob served again under a
+   * mintable id, steering new writes onto the never-rotating legacy CK)
+   * cryptographically impossible, on every device, with no local state.
+   */
+  it('refuses to unwrap a blob under a different key_id than it was wrapped as (THU-893)', async () => {
+    const ak = await generateAK()
+    const wrappedAsV1 = await wrapDEK(await generateDEK(true), ak, 'v1')
+    await expect(unwrapDEK(wrappedAsV1, ak, '1')).rejects.toThrow('Failed to unwrap DEK')
+    await expect(unwrapDEK(wrappedAsV1, ak, '0')).rejects.toThrow('Failed to unwrap DEK')
+    // The genuine label still opens — the binding, not the blob, is what changed.
+    expect((await unwrapDEK(wrappedAsV1, ak, 'v1')).algorithm.name).toBe('AES-GCM')
+  })
+
+  it('produces different blobs for the same DEK (random IV, not deterministic AES-KW)', async () => {
+    const ak = await generateAK()
+    const dek = await generateDEK(true)
+    expect(await wrapDEK(dek, ak, '0')).not.toBe(await wrapDEK(dek, ak, '0'))
   })
 })
 
 describe('mintDEK', () => {
   it('returns a non-extractable DEK that matches the wrapped blob', async () => {
     const ak = await generateAK()
-    const { dek, wrappedKey } = await mintDEK(ak)
+    const { dek, wrappedKey } = await mintDEK(ak, '1')
     expect(dek.extractable).toBe(false)
 
     const encrypted = await encrypt('minted', dek)
-    expect(await decrypt(encrypted, await unwrapDEK(wrappedKey, ak))).toBe('minted')
+    expect(await decrypt(encrypted, await unwrapDEK(wrappedKey, ak, '1'))).toBe('minted')
   })
 })
 
@@ -166,7 +188,7 @@ describe('wrapAK / unwrapAK', () => {
       ecdh.privateKey,
       mlkem.secretKey,
     )
-    expect(unwrapped.algorithm.name).toBe('AES-KW')
+    expect(unwrapped.algorithm.name).toBe('AES-GCM')
     expect(unwrapped.extractable).toBe(false)
     expect([...unwrapped.usages].sort()).toEqual(['unwrapKey', 'wrapKey'])
   })
@@ -178,13 +200,13 @@ describe('wrapAK / unwrapAK', () => {
     const dek = await generateDEK(true)
 
     const encrypted = await encrypt('wrap test', dek)
-    const wrappedDek = await wrapDEK(dek, ak)
+    const wrappedDek = await wrapDEK(dek, ak, '0')
     const unwrappedAk = await unwrapAK(
       await wrapAK(ak, ecdh.publicKey, mlkem.publicKey),
       ecdh.privateKey,
       mlkem.secretKey,
     )
-    expect(await decrypt(encrypted, await unwrapDEK(wrappedDek, unwrappedAk))).toBe('wrap test')
+    expect(await decrypt(encrypted, await unwrapDEK(wrappedDek, unwrappedAk, '0'))).toBe('wrap test')
   })
 
   it('produces different wrapped values for the same key pair (ephemeral key)', async () => {
@@ -218,11 +240,11 @@ describe('rewrapAK', () => {
     const dek = await generateDEK(true)
 
     const encrypted = await encrypt('rewrap test', dek)
-    const wrappedDek = await wrapDEK(dek, ak)
+    const wrappedDek = await wrapDEK(dek, ak, '0')
     const wrappedAk = await wrapAK(ak, ecdh1.publicKey, mlkem1.publicKey)
     const rewrapped = await rewrapAK(wrappedAk, ecdh1.privateKey, mlkem1.secretKey, ecdh2.publicKey, mlkem2.publicKey)
     const unwrappedAk = await unwrapAK(rewrapped, ecdh2.privateKey, mlkem2.secretKey)
-    expect(await decrypt(encrypted, await unwrapDEK(wrappedDek, unwrappedAk))).toBe('rewrap test')
+    expect(await decrypt(encrypted, await unwrapDEK(wrappedDek, unwrappedAk, '0'))).toBe('rewrap test')
   })
 })
 
@@ -231,8 +253,8 @@ describe('rewrapKeyring (AK rotation)', () => {
     const oldAK = await generateAK()
     const newAK = await generateAK()
 
-    const { dek: dek0, wrappedKey: wrapped0 } = await mintDEK(oldAK)
-    const { dek: dek1, wrappedKey: wrapped1 } = await mintDEK(oldAK)
+    const { dek: dek0, wrappedKey: wrapped0 } = await mintDEK(oldAK, '0')
+    const { dek: dek1, wrappedKey: wrapped1 } = await mintDEK(oldAK, 'v1')
     const value0 = await encrypt('value under key 0', dek0)
     const value1 = await encrypt('value under key 1', dek1)
 
@@ -250,9 +272,9 @@ describe('rewrapKeyring (AK rotation)', () => {
     const byId = Object.fromEntries(rewrapped.map((e) => [e.keyId, e.wrappedKey]))
 
     // Old AK can no longer unwrap the new blobs; new AK can.
-    await expect(unwrapDEK(byId['0'], oldAK)).rejects.toThrow('Failed to unwrap DEK')
-    expect(await decrypt(value0, await unwrapDEK(byId['0'], newAK))).toBe('value under key 0')
-    expect(await decrypt(value1, await unwrapDEK(byId['v1'], newAK))).toBe('value under key 1')
+    await expect(unwrapDEK(byId['0'], oldAK, '0')).rejects.toThrow('Failed to unwrap DEK')
+    expect(await decrypt(value0, await unwrapDEK(byId['0'], newAK, '0'))).toBe('value under key 0')
+    expect(await decrypt(value1, await unwrapDEK(byId['v1'], newAK, 'v1'))).toBe('value under key 1')
   })
 
   /**
@@ -264,10 +286,10 @@ describe('rewrapKeyring (AK rotation)', () => {
   it('passes an unopenable row through unchanged instead of failing the rotation', async () => {
     const oldAK = await generateAK()
     const newAK = await generateAK()
-    const { dek: dek0, wrappedKey: wrapped0 } = await mintDEK(oldAK)
+    const { dek: dek0, wrappedKey: wrapped0 } = await mintDEK(oldAK, '0')
     const value0 = await encrypt('value under key 0', dek0)
     // Wrapped under a key nobody on the account holds — the shape of a planted row.
-    const { wrappedKey: junk } = await mintDEK(await generateAK())
+    const { wrappedKey: junk } = await mintDEK(await generateAK(), '7')
 
     const { wrappedKeys, strandedKeyIds } = await rewrapKeyring(
       [
@@ -287,12 +309,12 @@ describe('rewrapKeyring (AK rotation)', () => {
     // key it was wrapped under can repair it by rotating again.
     expect(byId['7']).toBe(junk)
     // The good rows really did move to the new AK.
-    expect(await decrypt(value0, await unwrapDEK(byId['0'], newAK))).toBe('value under key 0')
+    expect(await decrypt(value0, await unwrapDEK(byId['0'], newAK, '0'))).toBe('value under key 0')
   })
 
   it('reports every key_id as stranded when none of them open', async () => {
-    const { wrappedKey: junkA } = await mintDEK(await generateAK())
-    const { wrappedKey: junkB } = await mintDEK(await generateAK())
+    const { wrappedKey: junkA } = await mintDEK(await generateAK(), '0')
+    const { wrappedKey: junkB } = await mintDEK(await generateAK(), 'v1')
 
     const { wrappedKeys, strandedKeyIds } = await rewrapKeyring(
       [
@@ -419,7 +441,7 @@ describe('importOrgPublicKey / wrapAKForOrg (THU-804 org escrow)', () => {
       false,
       ['unwrapKey'],
     )
-    return crypto.subtle.unwrapKey('raw', wrappedAKBytes as BufferSource, kwKey, 'AES-KW', 'AES-KW', true, [
+    return crypto.subtle.unwrapKey('raw', wrappedAKBytes as BufferSource, kwKey, 'AES-KW', 'AES-GCM', true, [
       'wrapKey',
       'unwrapKey',
     ])

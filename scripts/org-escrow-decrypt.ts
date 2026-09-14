@@ -24,6 +24,7 @@
 import { parseArgs } from 'node:util'
 import postgres from 'postgres'
 import {
+  dekWrapAAD,
   encPrefix,
   encV2Prefix,
   encodeAAD,
@@ -103,12 +104,14 @@ export const unwrapEscrowedAK = async (envelope: OrgEnvelope, privateKeyBase64: 
     ['unwrapKey'],
   )
   try {
+    // The AK's own type is AES-GCM (it wraps DEKs with a key_id AAD, THU-893);
+    // the envelope wrapping it stays AES-KW.
     return await crypto.subtle.unwrapKey(
       'raw',
       envelope.wrappedAk as BufferSource,
       kwKey,
       'AES-KW',
-      'AES-KW',
+      'AES-GCM',
       false,
       ['unwrapKey'],
     )
@@ -123,7 +126,9 @@ export const unwrapEscrowedAK = async (envelope: OrgEnvelope, privateKeyBase64: 
 
 /**
  * Unwrap the full DEK keyring under the recovered AK. Each `wrapped_key` is
- * base64 AES-KW(DEK); DEKs are AES-256-GCM decrypt-only.
+ * base64(`iv ‖ AES-GCM(DEK)`) with the row's key_id bound as AAD (`dekWrapAAD`,
+ * THU-893) — the AAD here MUST come from the row's own key_id, mirroring the
+ * client; DEKs are AES-256-GCM decrypt-only.
  *
  * SKIPS rows that will not open, reporting them on stderr, rather than failing
  * the run (THU-871). This is break-glass recovery and it needs exactly ONE
@@ -139,11 +144,12 @@ export const unwrapKeyring = async (entries: WrappedKeyEntry[], ak: CryptoKey): 
   const skipped: KeyId[] = []
   for (const { keyId, wrappedKey } of entries) {
     try {
+      const blob = base64ToBytes(wrappedKey)
       const dek = await crypto.subtle.unwrapKey(
         'raw',
-        base64ToBytes(wrappedKey) as BufferSource,
+        blob.slice(12) as BufferSource,
         ak,
-        'AES-KW',
+        { name: 'AES-GCM', iv: blob.slice(0, 12) as BufferSource, additionalData: dekWrapAAD(keyId) as BufferSource },
         'AES-GCM',
         false,
         ['decrypt'],

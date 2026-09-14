@@ -25,7 +25,7 @@ const deleteDatabase = (): Promise<void> =>
 const setupKeyring = async () => {
   const ak = await generateAK()
   await storeAK(ak)
-  const { wrappedKey } = await mintDEK(ak)
+  const { wrappedKey } = await mintDEK(ak, '0')
   await storeDEK('0', wrappedKey)
   await storePrimaryKeyId('0')
 }

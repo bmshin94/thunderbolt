@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js'
-import { orgEnvelopeVersion, orgEscrowHkdfInfo, p256RawPublicKeyLength } from '@shared/e2ee-types'
+import { dekWrapAAD, orgEnvelopeVersion, orgEscrowHkdfInfo, p256RawPublicKeyLength } from '@shared/e2ee-types'
 import { DecryptionError, EncryptionError } from './errors'
 
 const ecdhAlgorithm = 'ECDH'
@@ -105,23 +105,28 @@ export const deriveMlKemAtRestKey = async (
 }
 
 // =============================================================================
-// AK (Account Key, AES-KW) + DEK (Data Encryption Key, AES-GCM)
+// AK (Account Key, AES-GCM wrap-only) + DEK (Data Encryption Key, AES-GCM)
 // =============================================================================
 
 /**
- * Generate an Account Key: AES-KW 256, `wrapKey`/`unwrapKey` ONLY — it must be
+ * Generate an Account Key: AES-GCM 256, `wrapKey`/`unwrapKey` ONLY — it must be
  * unable to encrypt data (access control, not data encryption).
+ *
+ * AES-GCM rather than AES-KW because DEK wrapping binds the `key_id` into the
+ * blob as AAD (THU-893, see `wrapDEK`) and AES-KW takes no AAD. The wrap-only
+ * usages are what keep the AK out of the data plane despite sharing GCM with
+ * the DEKs.
  * @param extractable - `true` only transiently during setup (the AK must be
  *   extractable to be wrapped into device envelopes). Re-import via
  *   `reimportAsNonExtractable` before storing.
  */
 export const generateAK = async (extractable = false): Promise<CryptoKey> =>
-  crypto.subtle.generateKey({ name: aesKwAlgorithm, length: aesKeyLength }, extractable, ['wrapKey', 'unwrapKey'])
+  crypto.subtle.generateKey({ name: aesGcmAlgorithm, length: aesKeyLength }, extractable, ['wrapKey', 'unwrapKey'])
 
 /** Re-import an extractable AK as non-extractable. Used after setup wrapping. */
 export const reimportAsNonExtractable = async (ak: CryptoKey): Promise<CryptoKey> => {
   const raw = await crypto.subtle.exportKey('raw', ak)
-  return crypto.subtle.importKey('raw', raw, { name: aesKwAlgorithm, length: aesKeyLength }, false, [
+  return crypto.subtle.importKey('raw', raw, { name: aesGcmAlgorithm, length: aesKeyLength }, false, [
     'wrapKey',
     'unwrapKey',
   ])
@@ -136,24 +141,54 @@ export const reimportAsNonExtractable = async (ak: CryptoKey): Promise<CryptoKey
 export const generateDEK = async (extractable = false): Promise<CryptoKey> =>
   crypto.subtle.generateKey({ name: aesGcmAlgorithm, length: aesKeyLength }, extractable, ['encrypt', 'decrypt'])
 
-/** Wrap a DEK under the AK with AES-KW. The DEK must be extractable at wrap time. */
-export const wrapDEK = async (dek: CryptoKey, ak: CryptoKey): Promise<string> => {
+/**
+ * Wrap a DEK under the AK with AES-GCM, binding `keyId` into the blob as AAD
+ * (THU-893 — see `dekWrapAAD`). The blob is base64(`iv(12) ‖ ciphertext‖tag`),
+ * so a keyring row served under any OTHER key_id fails to unwrap on the auth
+ * tag: relabelling a blob is cryptographically impossible, with no local state
+ * and nothing for a malicious server to withhold. The DEK must be extractable
+ * at wrap time.
+ */
+export const wrapDEK = async (dek: CryptoKey, ak: CryptoKey, keyId: string): Promise<string> => {
   try {
-    const wrapped = await crypto.subtle.wrapKey('raw', dek, ak, aesKwAlgorithm)
-    return uint8ArrayToBase64(new Uint8Array(wrapped))
+    const iv = crypto.getRandomValues(new Uint8Array(ivLength))
+    const wrapped = new Uint8Array(
+      await crypto.subtle.wrapKey('raw', dek, ak, {
+        name: aesGcmAlgorithm,
+        iv,
+        additionalData: dekWrapAAD(keyId) as BufferSource,
+      }),
+    )
+    const blob = new Uint8Array(iv.length + wrapped.length)
+    blob.set(iv, 0)
+    blob.set(wrapped, iv.length)
+    return uint8ArrayToBase64(blob)
   } catch (err) {
     throw new EncryptionError('Failed to wrap DEK', { cause: err })
   }
 }
 
-/** Unwrap an AES-KW-wrapped DEK (base64) under the AK. Non-extractable by default. */
-export const unwrapDEK = async (wrappedBase64: string, ak: CryptoKey, extractable = false): Promise<CryptoKey> => {
+/**
+ * Unwrap a wrapped DEK (base64) under the AK. `keyId` MUST be the id the caller
+ * is resolving the row AS (its keyring label / the wire key_id) — never a
+ * separately server-supplied value — so a blob created under a different id
+ * fails here (THU-893). Non-extractable by default.
+ */
+export const unwrapDEK = async (
+  wrappedBase64: string,
+  ak: CryptoKey,
+  keyId: string,
+  extractable = false,
+): Promise<CryptoKey> => {
   try {
+    const blob = base64ToUint8Array(wrappedBase64)
+    const iv = blob.slice(0, ivLength)
+    const wrapped = blob.slice(ivLength)
     return await crypto.subtle.unwrapKey(
       'raw',
-      base64ToUint8Array(wrappedBase64),
+      wrapped as BufferSource,
       ak,
-      aesKwAlgorithm,
+      { name: aesGcmAlgorithm, iv: iv as BufferSource, additionalData: dekWrapAAD(keyId) as BufferSource },
       { name: aesGcmAlgorithm, length: aesKeyLength },
       extractable,
       ['encrypt', 'decrypt'],
@@ -164,14 +199,14 @@ export const unwrapDEK = async (wrappedBase64: string, ak: CryptoKey, extractabl
 }
 
 /**
- * Mint a new DEK already wrapped under the AK. The extractable copy exists only
- * inside this function; the returned `dek` is the non-extractable unwrap of the
- * returned `wrappedKey` (single source of truth).
+ * Mint a new DEK already wrapped under the AK as `keyId`. The extractable copy
+ * exists only inside this function; the returned `dek` is the non-extractable
+ * unwrap of the returned `wrappedKey` (single source of truth).
  */
-export const mintDEK = async (ak: CryptoKey): Promise<{ dek: CryptoKey; wrappedKey: string }> => {
+export const mintDEK = async (ak: CryptoKey, keyId: string): Promise<{ dek: CryptoKey; wrappedKey: string }> => {
   const extractableDek = await generateDEK(true)
-  const wrappedKey = await wrapDEK(extractableDek, ak)
-  const dek = await unwrapDEK(wrappedKey, ak)
+  const wrappedKey = await wrapDEK(extractableDek, ak, keyId)
+  const dek = await unwrapDEK(wrappedKey, ak, keyId)
   return { dek, wrappedKey }
 }
 
@@ -216,12 +251,12 @@ export const rewrapKeyring = async (
     const strandedKeyIds: string[] = []
     const rewrapped = await Promise.all(
       wrappedKeys.map(async ({ keyId, wrappedKey }) => {
-        const tempDek = await unwrapDEK(wrappedKey, oldAK, true).catch(() => null)
+        const tempDek = await unwrapDEK(wrappedKey, oldAK, keyId, true).catch(() => null)
         if (!tempDek) {
           strandedKeyIds.push(keyId)
           return { keyId, wrappedKey }
         }
-        return { keyId, wrappedKey: await wrapDEK(tempDek, newAK) }
+        return { keyId, wrappedKey: await wrapDEK(tempDek, newAK, keyId) }
       }),
     )
     return { wrappedKeys: rewrapped, strandedKeyIds }
@@ -401,7 +436,7 @@ const unwrapAKInternal = async (
       wrappedKeyBytes as BufferSource,
       unwrappingKey,
       aesKwAlgorithm,
-      { name: aesKwAlgorithm, length: aesKeyLength },
+      { name: aesGcmAlgorithm, length: aesKeyLength },
       extractable,
       ['wrapKey', 'unwrapKey'],
     )

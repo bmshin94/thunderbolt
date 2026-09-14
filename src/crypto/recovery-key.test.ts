@@ -160,10 +160,10 @@ describe('deriveRecoveryKeyPairFromSeed', () => {
 
     const unwrapper = await deriveRecoveryKeyPairFromSeed(seed, salt)
     const ak = await unwrapAK(envelope, unwrapper.ecdhPrivateKey, unwrapper.mlkemSecretKey)
-    expect(ak.algorithm.name).toBe('AES-KW')
+    expect(ak.algorithm.name).toBe('AES-GCM')
 
     const dek = await generateDEK(true)
-    expect((await unwrapDEK(await wrapDEK(dek, ak), ak)).algorithm.name).toBe('AES-GCM')
+    expect((await unwrapDEK(await wrapDEK(dek, ak, '0'), ak, '0')).algorithm.name).toBe('AES-GCM')
   })
 
   it('cannot unwrap an envelope sealed to a different phrase', async () => {
