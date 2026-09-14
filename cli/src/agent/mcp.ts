@@ -69,9 +69,12 @@ const createTransport = (server: McpServerConfig) => {
     return new StdioClientTransport({
       command: server.command as string,
       args: [...(server.args ?? [])],
-      // Inherit nothing by default. A served agent's environment holds the
-      // Thunderbolt credential and whatever else the host injects; an MCP
-      // server gets only what its config names.
+      // Passed env is merged over the SDK's own safelist — it always includes
+      // `getDefaultEnvironment()` (HOME, PATH, SHELL, TERM, USER on POSIX), so
+      // this narrows rather than isolates. That is the part that matters: the
+      // served agent's environment also holds the Thunderbolt credential and
+      // whatever else the host injects, and none of that is on the safelist.
+      // Verified by spawning a server that echoes its own environment.
       env: { ...(server.env ?? {}) },
     })
   }
