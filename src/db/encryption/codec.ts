@@ -218,6 +218,22 @@ const getCachedAK = async (): Promise<CryptoKey | null> => {
   return cachedAK
 }
 
+/**
+ * Whether this device holds a staged Account Key — the client-local fact that
+ * arms the download-side plaintext quarantine (THU-874). Deliberately NOT the
+ * server-supplied `scheme_version`: a gate the server can switch off by lying
+ * about the account is no gate (the config-flag-downgrade shape). Errors read
+ * as "no key" so a broken IndexedDB degrades to pre-E2EE passthrough rather
+ * than a sync outage — an error is not a state an attacker can induce remotely.
+ */
+export const hasStagedAK = async (): Promise<boolean> => {
+  try {
+    return (await getCachedAK()) != null
+  } catch {
+    return false
+  }
+}
+
 type DekResolution = { dek: CryptoKey } | { failure: 'no-keys' | KeyRequestReason }
 
 const resolveDEK = async (keyId: KeyId): Promise<DekResolution> => {

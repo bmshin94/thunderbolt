@@ -277,6 +277,12 @@ See `docs/architecture/e2ee-org-escrow-poc-plan.md` (local scratch plan) for the
 
 Add the table and column name to `encryptedColumnsMap` in [src/db/encryption/config.ts](../../src/db/encryption/config.ts). The middleware handles every column in the map automatically — download decryption and upload encryption (which binds AAD from the row context).
 
+**If plaintext rows for the column already exist server-side, ship a re-encryption data migration in the same change** (the `reencrypt-agents` shape in `src/lib/data-migrations/`): the download quarantine below refuses plaintext in mapped columns, so historical rows would otherwise be quarantined on every device enrolled afterwards. The migration must be a delete+reinsert (a same-value UPDATE diffs to an empty CRUD patch and never changes the server copy) and must not mark itself done when it finds zero local rows.
+
+## Download quarantine (THU-874)
+
+On a device holding an Account Key — a client-local fact; the server-supplied `scheme_version` is deliberately not consulted, since a lying server could use it to switch the guard off — a sync PUT carrying a non-`__enc:` value in a mapped column is suppressed by `EncryptionMiddleware`: the op is flipped to a MOVE, which consumes the op_id and server-supplied checksum (dropping the op outright would fail checkpoint validation) but writes nothing. Every legitimate writer encrypts those columns on upload and the backend rejects plaintext uploads to them, so a plaintext arrival has exactly one possible author: the server. A mutated row keeps its previous good value; an injected row never lands; nothing is ever written as NULL (`models.name`/`url` are NOT NULL, and a nulled cell riding a later upload would wedge the CRUD queue). Legacy `__enc:` v1 values stay accepted (dual-read), and decryption itself stays map-blind so stale bundles keep decoding columns their bundled map predates.
+
 ## Key Files
 
 | File                                | Role                                                                        |

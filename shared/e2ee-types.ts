@@ -140,6 +140,10 @@ export const encryptedColumnsMap: Readonly<Record<string, readonly string[]>> = 
     'nudge_search_retry',
     'provider_options',
   ],
+  // Upload-encoding only in practice: the row is INSERTED by the backend at
+  // registration with the plaintext name a keyless device sent, so the download
+  // quarantine exempts `devices` (see EncryptionMiddleware). A rename through
+  // the UI still encrypts.
   devices: ['name'],
   skills: ['name', 'label', 'description', 'instruction'],
   // `icon` (a single emoji chosen from a fixed set) and `pinned_order` stay
@@ -152,12 +156,17 @@ export const encryptedColumnsMap: Readonly<Record<string, readonly string[]>> = 
   // carry no user-authored content and are inert without `url`. `icon` matches
   // the `skills` rule above.
   //
-  // Forward-only: rows written before this entry existed stay cleartext at rest
-  // (no re-encryption pass exists anywhere) — an accepted residual recorded in
-  // C1. NOTE `name` and `url` are the first mapped columns that are NOT NULL in
-  // Postgres (`backend/src/db/powersync-schema.ts`), so a download-side
-  // quarantine (THU-874) cannot null them without the rejected upload wedging
-  // the CRUD queue.
+  // Rows written before this entry existed synced as cleartext; the
+  // `reencrypt-agents` data migration (THU-874) re-saves them through the
+  // encrypting upload path, because the download quarantine would otherwise
+  // refuse them on every newly-enrolled device. RULE: adding a column or table
+  // to this map while plaintext rows for it already exist server-side requires
+  // the same kind of migration in the same change — see C1 in
+  // docs/architecture/e2ee-threat-model.md. NOTE `name` and `url` are the first
+  // mapped columns that are NOT NULL in Postgres
+  // (`backend/src/db/powersync-schema.ts`), which is why the quarantine
+  // suppresses whole sync ops (op → MOVE) rather than nulling columns — a
+  // nulled cell riding a later upload would wedge the CRUD queue.
   agents: ['name', 'url', 'description'],
 }
 

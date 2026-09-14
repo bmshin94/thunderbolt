@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import type { SyncDataBucket } from '../TransformableBucketStorage'
 import type { EncryptionCodec, EncryptionContext } from '@/db/encryption/codec'
 import { createEncryptionMiddleware } from './EncryptionMiddleware'
@@ -205,6 +205,118 @@ describe('encryptionMiddleware', () => {
       const row = JSON.parse(result.data[0].data!)
       expect(row.item).toBe('__enc:v2:0:iv:ct')
       expect(row.name).toBe('v1-decrypted(__enc:iv:ct)')
+    })
+  })
+
+  describe('plaintext quarantine (THU-874)', () => {
+    // Armed = the device holds an AK, injected explicitly. The default gate
+    // (hasStagedAK) reads as disarmed in this suite — no IndexedDB here — which
+    // is what keeps the passthrough tests above meaningful as the pre-E2EE case.
+    const armed = createEncryptionMiddleware(fakeCodec, async () => true)
+
+    const withSilencedConsoleError = async (run: () => Promise<void>) => {
+      // R-SUPPRESSCONSOLE: the quarantine logs loudly by design; the log is the
+      // expected outcome here, not noise to fail on.
+      const spy = spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        await run()
+        return spy.mock.calls.map((call) => String(call[0]))
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it('suppresses a PUT carrying a plaintext string in a mapped column (op → MOVE, data stripped)', async () => {
+      const entry = makeEntry('models', { name: 'attacker model', provider: 'custom' })
+      const logs = await withSilencedConsoleError(async () => {
+        await armed.transform(makeBucket(entry))
+      })
+
+      expect(entry.op).toBe('MOVE')
+      expect(entry.data).toBeUndefined()
+      expect(logs.some((line) => line.includes('models.name'))).toBe(true)
+    })
+
+    it('suppresses a non-string, non-null value in a mapped column (smuggled JSON shapes)', async () => {
+      const entry = makeEntry('models', { url: { u: 'https://evil.example' } })
+      await withSilencedConsoleError(async () => {
+        await armed.transform(makeBucket(entry))
+      })
+
+      expect(entry.op).toBe('MOVE')
+      expect(entry.data).toBeUndefined()
+    })
+
+    it('accepts both wire formats in mapped columns: v2 decodes, legacy v1 decodes', async () => {
+      const entry = makeEntry('tasks', { item: '__enc:iv:ct' })
+      const result = await armed.transform(makeBucket(entry))
+
+      expect(entry.op).toBe('PUT')
+      expect(JSON.parse(result.data[0].data!).item).toBe('decrypted(__enc:iv:ct)')
+    })
+
+    it('passes null in a mapped column and plaintext in unmapped columns', async () => {
+      const entry = makeEntry('models', {
+        name: '__enc:iv:ct',
+        description: null,
+        provider: 'openai',
+        sort_order: 3,
+      })
+      const result = await armed.transform(makeBucket(entry))
+
+      expect(entry.op).toBe('PUT')
+      const row = JSON.parse(result.data[0].data!)
+      expect(row.description).toBeNull()
+      expect(row.provider).toBe('openai')
+      expect(row.sort_order).toBe(3)
+    })
+
+    it('exempts devices rows — registration writes a plaintext name before the device has keys', async () => {
+      const entry = makeEntry('devices', { name: 'Firefox on macOS', trusted: 0 })
+      const result = await armed.transform(makeBucket(entry))
+
+      expect(entry.op).toBe('PUT')
+      expect(JSON.parse(result.data[0].data!).name).toBe('Firefox on macOS')
+    })
+
+    it('fails open for a table absent from the bundled map (stale-bundle rule)', async () => {
+      const entry = makeEntry('some_future_table', { secret: 'plain' })
+      const result = await armed.transform(makeBucket(entry))
+
+      expect(entry.op).toBe('PUT')
+      expect(JSON.parse(result.data[0].data!).secret).toBe('plain')
+    })
+
+    it('only PUT ops are candidates — a non-PUT op with data passes untouched', async () => {
+      const entry = {
+        object_type: 'models',
+        object_id: 'id-1',
+        data: JSON.stringify({ name: 'x' }),
+        op: 'REMOVE',
+      } as SyncEntry
+      await armed.transform(makeBucket(entry))
+      expect(entry.op).toBe('REMOVE')
+    })
+
+    it('disarmed (no AK): plaintext in a mapped column persists — the pre-E2EE account by design', async () => {
+      const disarmed = createEncryptionMiddleware(fakeCodec, async () => false)
+      const entry = makeEntry('models', { name: 'my plaintext model' })
+      const result = await disarmed.transform(makeBucket(entry))
+
+      expect(entry.op).toBe('PUT')
+      expect(JSON.parse(result.data[0].data!).name).toBe('my plaintext model')
+    })
+
+    it('quarantines only the poisoned entry — siblings in the bucket still decode', async () => {
+      const poisoned = makeEntry('models', { url: 'https://attacker.example/v1' })
+      const clean = makeEntry('tasks', { item: '__enc:a:b' })
+      const result = await withSilencedConsoleError(async () => {
+        const bucket = await armed.transform(makeBucket(poisoned, clean))
+        expect(JSON.parse(bucket.data[1].data!).item).toBe('decrypted(__enc:a:b)')
+      })
+
+      expect(poisoned.op).toBe('MOVE')
+      expect(result.length).toBeGreaterThan(0)
     })
   })
 })
