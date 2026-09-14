@@ -577,6 +577,13 @@ export type RecoverySlotRequest = {
 export type RotateRequest = RecoverySlotRequest & {
   /** Challenge proof with operation 'rotate'. */
   proof: ChallengeProof
+  /**
+   * Step-up verification code (THU-875): the server refuses a rotation whose
+   * recovery slot re-anchors to DIFFERENT recovery keys than the stored ones (a
+   * phrase change) unless this carries a valid emailed code. Same-key rotations
+   * (revocation's silent re-anchor) never need it.
+   */
+  stepUpOtp?: string
   /** The new AK wrapped per trusted device (`wrappedCK` historically named — it carries the AK). */
   envelopes: Array<{ deviceId: string; wrappedCK: string }>
   /** The FULL keyring re-wrapped under the new AK — every existing key_id, no exceptions. */

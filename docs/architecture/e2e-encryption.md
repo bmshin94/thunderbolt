@@ -245,6 +245,36 @@ not takeover (THU-871). And because the signing key derives from the canary secr
 device retains DEK `"0"` and can still fetch the current canary (THU-872), so a server colluding
 with a revoked device can forge an attestation; closing THU-872 closes this too.
 
+## Recovery re-anchor step-up + security emails (THU-875)
+
+The attestation above authenticates the ACCOUNT — any keyring holder signs a valid one — not the
+human. So a still-trusted attacker (an in-origin script, a borrowed unlocked session) could run the
+legitimate change-phrase flow and silently replace the recovery phrase with one it chose, and the
+plant survived the revoke that removed it. Two controls close that:
+
+**Step-up gate (server-enforced).** `POST /encryption/rotate` compares the request's recovery public
+keys against the stored ones — intent derived from effect, never from a client-declared mode, since
+the client may be the attacker. Differing keys (a phrase change) require `stepUpOtp`: an 8-digit
+code minted server-side (`auth.api.createVerificationOTP`, type `email-verification` — unused by
+anything else in this app) and emailed by `securityNotifications.sendStepUpCode`, always to the
+SESSION's email. Refusals are `403 { code: 'step_up_required' | 'step_up_invalid' }`; the client
+maps them to `StepUpVerificationError` (never `RotationStaleError` — no refresh, just re-prompt).
+The code is consumed (verification row deleted) only after the rotation COMMITS, so a rotation that
+fails midway retries with the same code. Matching keys — revocation's silent re-anchor — never see
+the gate: one-click revoke stays one-click. `POST /encryption/step-up/request` mints + emails the
+code (trusted devices only, 30s cooldown). The UI flow is confirm → code entry
+(`StepUpCodeDialog`, shared by the settings section and the unsaved-phrase prompt) → phrase display.
+The interim factor is an email OTP; it upgrades to a passkey/PRF assertion when THU-790 lands.
+
+**Security emails (out-of-band).** Every event where the recovery anchor moves or a device gains
+access notifies the account email — the channel an in-origin attacker cannot suppress:
+recovery-phrase changed (rotate with differing keys), device approved (with the approver's name),
+recovery-phrase used (a device self-approved via phrase), bridge connected (first registration
+only), and encryption set up / upgraded. Senders live in
+`backend/src/lib/security-notifications.tsx`, injected into `createEncryptionRoutes` for tests, and
+fire AFTER the transaction commits, fire-and-forget — a mail failure never fails a committed
+security operation.
+
 ## Migration (v1 → v2): absorb + permanent dual-read
 
 Existing v1 accounts (single CK) migrate to the v2 keyring with **zero data loss** and no re-upload of existing rows:

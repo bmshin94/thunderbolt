@@ -13,28 +13,43 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { RecoveryKeyDialog } from '@/components/recovery-key-dialog'
+import { StepUpCodeDialog } from '@/components/step-up-code-dialog'
 import { useE2eeReady } from '@/hooks/use-e2ee-ready'
 import { useChangeRecoveryKey } from './use-change-recovery-key'
 import type { HttpClient } from '@/contexts'
 
 type ChangeRecoveryKeySectionProps = {
   /** Dependency seam for the rotation (tests). Defaults to `changeRecoveryPhrase`. */
-  rotate?: (httpClient: HttpClient) => Promise<string>
+  rotate?: (httpClient: HttpClient, opts: { stepUpOtp: string }) => Promise<string>
+  /** Dependency seam for the step-up code request (tests). Defaults to `postStepUpRequest`. */
+  requestCode?: (httpClient: HttpClient) => Promise<void>
 }
 
 /**
- * "Change recovery phrase" row for the preferences Data section. Rotates the
- * Account Key (0 rows re-encrypted), re-anchors the recovery slot to a new
- * phrase, and shows those 24 words exactly once behind the saved-it
- * confirmation gate. This is the only place outside first-device setup and the
- * v1→v2 migration that mints a phrase — device revocation rotates silently.
- * Hidden until E2EE v2 is fully set up on this device — there is no key to
- * rotate before then.
+ * "Change recovery phrase" row for the preferences Data section. Confirms,
+ * emails a step-up code (THU-875 — the server refuses a recovery re-anchor
+ * without it), then rotates the Account Key (0 rows re-encrypted), re-anchors
+ * the recovery slot to a new phrase, and shows those 24 words exactly once
+ * behind the saved-it confirmation gate. This is the only place outside
+ * first-device setup and the v1→v2 migration that mints a phrase — device
+ * revocation rotates silently. Hidden until E2EE v2 is fully set up on this
+ * device — there is no key to rotate before then.
  */
-export const ChangeRecoveryKeySection = ({ rotate }: ChangeRecoveryKeySectionProps) => {
+export const ChangeRecoveryKeySection = ({ rotate, requestCode }: ChangeRecoveryKeySectionProps) => {
   const ready = useE2eeReady()
-  const { status, isRotating, newRecoveryKey, error, openConfirm, cancel, confirmRotation, done } =
-    useChangeRecoveryKey(rotate)
+  const {
+    status,
+    isBusy,
+    otp,
+    newRecoveryKey,
+    error,
+    openConfirm,
+    cancel,
+    setOtp,
+    requestStepUpCode,
+    confirmRotation,
+    done,
+  } = useChangeRecoveryKey(rotate, requestCode)
 
   if (!ready) {
     return null
@@ -56,13 +71,13 @@ export const ChangeRecoveryKeySection = ({ rotate }: ChangeRecoveryKeySectionPro
         </Button>
       </div>
 
-      <AlertDialog open={status === 'confirming'} onOpenChange={(open) => !open && !isRotating && cancel()}>
+      <AlertDialog open={status === 'confirming'} onOpenChange={(open) => !open && !isBusy && cancel()}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Change your recovery phrase?</AlertDialogTitle>
             <AlertDialogDescription>
               A new 24-word recovery phrase will be generated and shown to you once. Your current phrase will stop
-              working immediately. Your synced data is unaffected.
+              working immediately. Your synced data is unaffected. To continue, we’ll email you a verification code.
             </AlertDialogDescription>
           </AlertDialogHeader>
           {error && (
@@ -72,15 +87,26 @@ export const ChangeRecoveryKeySection = ({ rotate }: ChangeRecoveryKeySectionPro
           )}
           <AlertDialogFooter>
             {/* Radix's Cancel closes the dialog itself; a plain Button for the
-                confirm keeps the dialog open while the rotation is in flight
+                confirm keeps the dialog open while the request is in flight
                 (and doubles as the retry affordance on failure). */}
-            <AlertDialogCancel disabled={isRotating}>Cancel</AlertDialogCancel>
-            <Button onClick={confirmRotation} isLoading={isRotating} loadingLabel="Generating…">
-              {error ? 'Try again' : 'Generate new phrase'}
+            <AlertDialogCancel disabled={isBusy}>Cancel</AlertDialogCancel>
+            <Button onClick={requestStepUpCode} isLoading={isBusy} loadingLabel="Sending code…">
+              {error ? 'Try again' : 'Send code'}
             </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <StepUpCodeDialog
+        open={status === 'stepUp'}
+        otp={otp}
+        isBusy={isBusy}
+        error={error}
+        onOtpChange={setOtp}
+        onResend={requestStepUpCode}
+        onSubmit={confirmRotation}
+        onCancel={cancel}
+      />
 
       <RecoveryKeyDialog
         open={status === 'display'}

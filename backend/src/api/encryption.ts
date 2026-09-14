@@ -39,9 +39,11 @@ import {
 } from '@/dal'
 import type { Settings } from '@/config/settings'
 import type { db as DbType } from '@/db/client'
+import { verification } from '@/db/auth-schema'
 import { BadRequestError, ForbiddenError } from '@/errors/http-errors'
 import { verifyChallengeSignature, verifyPossessionProof } from '@/lib/canary'
 import { sealBindNonce } from '@/lib/device-bind'
+import { securityNotifications, type SecurityNotifications } from '@/lib/security-notifications'
 import {
   type ChallengeOperation,
   type RecoverySlotRequest,
@@ -53,7 +55,7 @@ import {
   keyIdPattern,
   legacyKeyId,
 } from '@shared/e2ee-types'
-import { sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import { Elysia, t } from 'elysia'
 
 const maxDevicesPerUser = 10
@@ -371,9 +373,84 @@ const mapEncryptionError = (err: unknown, set: { status?: number | string }): { 
  * wrapped-DEK keyring, challenge-response, AK rotation, and the v1→v2 upgrade.
  * All routes require authentication via session.
  */
-export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, settings: Settings) =>
+/**
+ * Step-up verification (THU-875). A rotation that moves the recovery anchor to
+ * DIFFERENT keys is a phrase change, and a still-trusted attacker (in-origin
+ * script, borrowed session) can run one silently through the legitimate flow —
+ * so it additionally requires proof-of-inbox: an emailed code checked against
+ * Better Auth's verification table, always keyed by the SESSION's email (the
+ * OTP check API itself is email-keyed and unauthenticated; this binding is the
+ * entire session↔proof link). The `email-verification` type is borrowed — this
+ * app has no password auth, so nothing else uses it, and the app's Better Auth
+ * OTP sender deliberately drops non-sign-in types, which is fine because the
+ * code is delivered exclusively through `securityNotifications.sendStepUpCode`.
+ */
+const stepUpOtpType = 'email-verification' as const
+
+/** Mirrors better-auth's `toOTPIdentifier` — the verification row's lookup key. */
+const stepUpIdentifier = (email: string): string => `${stepUpOtpType}-otp-${email.toLowerCase()}`
+
+/**
+ * Single-use enforcement: better-auth's check does NOT consume the code on
+ * success, so the rotate route deletes the row after its transaction commits.
+ * Delete-on-commit (not on-check) keeps a rotation that fails midway retryable
+ * with the same code.
+ */
+const consumeStepUpOtp = (database: typeof DbType, email: string) =>
+  database.delete(verification).where(eq(verification.identifier, stepUpIdentifier(email)))
+
+/** `resendStrategy: 'reuse'` re-sends the same code; the cooldown just caps email volume. */
+const stepUpRequestCooldownMs = 30_000
+const lastStepUpRequestAt = new Map<string, number>()
+
+/** Security emails ride committed transactions — a send failure is logged, never surfaced. */
+const notifyBestEffort = (label: string, send: Promise<void>): void => {
+  send.catch((err) => console.error(`[security-email] ${label} failed:`, err))
+}
+
+export const createEncryptionRoutes = (
+  auth: Auth,
+  database: typeof DbType,
+  settings: Settings,
+  notifications: SecurityNotifications = securityNotifications,
+) =>
   new Elysia()
     .use(createAuthMacro(auth))
+    .post(
+      '/encryption/step-up/request',
+      async ({ request, set, user: sessionUser, session }) => {
+        const userId = sessionUser!.id
+        const caller = await getCallerDevice(database, userId, request, session)
+        if ('error' in caller) {
+          set.status = caller.status
+          return { error: caller.error }
+        }
+        if (!caller.device.trusted) {
+          set.status = 403
+          return { error: 'Only trusted devices can request a step-up code' }
+        }
+        const last = lastStepUpRequestAt.get(userId)
+        if (last != null && Date.now() - last < stepUpRequestCooldownMs) {
+          set.status = 429
+          return { error: 'A code was just sent — wait a moment before requesting another' }
+        }
+        try {
+          const otp = await auth.api.createVerificationOTP({
+            body: { email: sessionUser!.email, type: stepUpOtpType },
+          })
+          await notifications.sendStepUpCode({
+            email: sessionUser!.email,
+            code: otp,
+            deviceName: caller.device.name ?? 'Unknown device',
+          })
+          lastStepUpRequestAt.set(userId, Date.now())
+          return { ok: true as const }
+        } catch (err) {
+          return mapEncryptionError(err, set)
+        }
+      },
+      { auth: true },
+    )
     .post(
       '/devices',
       async ({ body, set, user: sessionUser, session }) => {
@@ -546,6 +623,10 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
           return { error: 'Cannot overwrite envelope of an already-trusted device' }
         }
 
+        // Which security email this request earns (THU-875) — decided inside the
+        // tx where the authoritative reads happen, sent only after commit.
+        let accessGained: 'bootstrap' | 'approved' | 'recovery' | null = null
+
         try {
           await database.transaction(async (tx) => {
             const txDb = tx as unknown as typeof database
@@ -659,10 +740,43 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
               if (updated.length === 0) {
                 throw new ForbiddenError('Device has been revoked')
               }
+              // Bootstrap is its own wording; otherwise caller==target is the
+              // recovery-phrase self-approval (Shape 2 admits nothing else
+              // untrusted), and caller≠target is a normal approval.
+              accessGained = !metadata ? 'bootstrap' : callerDeviceId === deviceId ? 'recovery' : 'approved'
             }
           })
         } catch (err) {
           return mapEncryptionError(err, set)
+        }
+
+        if (accessGained === 'bootstrap') {
+          notifyBestEffort(
+            'encryption-set-up',
+            notifications.sendEncryptionSetUp({
+              email: sessionUser!.email,
+              deviceName: device.name ?? 'Unknown device',
+              upgraded: false,
+            }),
+          )
+        } else if (accessGained === 'recovery') {
+          notifyBestEffort(
+            'recovery-phrase-used',
+            notifications.sendRecoveryPhraseUsed({
+              email: sessionUser!.email,
+              deviceName: device.name ?? 'Unknown device',
+            }),
+          )
+        } else if (accessGained === 'approved') {
+          const approver = await getDeviceById(database, callerDeviceId)
+          notifyBestEffort(
+            'device-approved',
+            notifications.sendDeviceApproved({
+              email: sessionUser!.email,
+              deviceName: device.name ?? 'Unknown device',
+              approverName: approver?.name ?? 'Unknown device',
+            }),
+          )
         }
 
         return { trusted: true as const }
@@ -937,6 +1051,43 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
           return { error: 'Only trusted devices can rotate keys' }
         }
 
+        // THU-875 step-up gate. Intent is derived from EFFECT (body keys vs
+        // stored keys), never from a client-declared mode — the client here may
+        // be the attacker, and matching keys cannot be faked without the
+        // recovery private halves. Same-key rotations (revocation's silent
+        // re-anchor) never see this. Also closes THU-865's residual: differing
+        // keys can no longer ride a keep-shaped rotation unnoticed.
+        //
+        // Slot-shape validation first (repeated inside the tx), so a malformed
+        // recovery slot stays a 400 rather than masquerading as a step-up 403.
+        try {
+          assertRecoveryCoverage(body)
+        } catch (err) {
+          return mapEncryptionError(err, set)
+        }
+        const storedMetadata = await getEncryptionMetadata(database, userId)
+        const recoveryChanged =
+          storedMetadata != null &&
+          (storedMetadata.recoveryEcdhPublicKey !== body.recoveryEcdhPublicKey ||
+            storedMetadata.recoveryMlkemPublicKey !== body.recoveryMlkemPublicKey)
+        if (recoveryChanged) {
+          if (!body.stepUpOtp) {
+            set.status = 403
+            return { error: 'Step-up verification required to change the recovery phrase', code: 'step_up_required' }
+          }
+          // Session email, never client input — see `stepUpOtpType`.
+          const valid = await auth.api
+            .checkVerificationOTP({
+              body: { email: sessionUser!.email, type: stepUpOtpType, otp: body.stepUpOtp },
+            })
+            .then((result) => result.success)
+            .catch(() => false)
+          if (!valid) {
+            set.status = 403
+            return { error: 'Invalid or expired verification code', code: 'step_up_invalid' }
+          }
+        }
+
         try {
           const keyVersion = await database.transaction(async (tx) => {
             const txDb = tx as unknown as typeof database
@@ -987,6 +1138,19 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
               }
               await setPrimaryKeyId(txDb, userId, body.newPrimaryKey.keyId)
             }
+            // Race guard for the THU-875 gate: the pre-tx compare ran against a
+            // snapshot; if the stored keys moved between that read and this lock
+            // (a concurrent phrase change), an un-stepped-up request must not
+            // slide through on the stale "unchanged" verdict.
+            const txMetadata = await getEncryptionMetadata(txDb, userId)
+            const txRecoveryChanged =
+              txMetadata != null &&
+              (txMetadata.recoveryEcdhPublicKey !== body.recoveryEcdhPublicKey ||
+                txMetadata.recoveryMlkemPublicKey !== body.recoveryMlkemPublicKey)
+            if (txRecoveryChanged && !recoveryChanged) {
+              throw new ForbiddenError('Step-up verification required to change the recovery phrase')
+            }
+
             // The org envelope wraps the NEW AK — replaced atomically with the rotation.
             await persistOrgEnvelope(txDb, settings, userId, body.orgEnvelope)
             await replaceEncryptionMetadata(txDb, {
@@ -1007,6 +1171,23 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
             return newVersion
           })
 
+          if (recoveryChanged) {
+            // Consume the code only after the commit, so a rotation that failed
+            // midway stays retryable with the same code. A failed delete leaves
+            // the code valid until its own expiry for the inbox holder only —
+            // log, never fail a committed rotation over it.
+            await consumeStepUpOtp(database, sessionUser!.email).catch((err) =>
+              console.error('[step-up] failed to consume verification code:', err),
+            )
+            notifyBestEffort(
+              'recovery-phrase-changed',
+              notifications.sendRecoveryPhraseChanged({
+                email: sessionUser!.email,
+                deviceName: caller.device.name ?? 'Unknown device',
+              }),
+            )
+          }
+
           return { key_version: keyVersion }
         } catch (err) {
           return mapEncryptionError(err, set)
@@ -1019,6 +1200,7 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
           envelopes: t.Array(envelopeEntrySchema, { minItems: 1, maxItems: maxDevicesPerUser }),
           wrappedKeys: t.Array(wrappedKeyEntrySchema, { minItems: 1, maxItems: maxKeyringKeys }),
           newPrimaryKey: t.Optional(newPrimaryKeySchema),
+          stepUpOtp: t.Optional(t.String({ minLength: 1, maxLength: 64 })),
           canaryIv: t.String({ maxLength: 500 }),
           canaryCtext: t.String({ maxLength: 500 }),
           signingPublicKey: t.String({ maxLength: 500 }),
@@ -1119,6 +1301,15 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
             await persistOrgEnvelope(txDb, settings, userId, body.orgEnvelope)
             return { keyVersion: flipped.keyVersion, schemeVersion: flipped.schemeVersion }
           })
+
+          notifyBestEffort(
+            'encryption-upgraded',
+            notifications.sendEncryptionSetUp({
+              email: sessionUser!.email,
+              deviceName: caller.device.name ?? 'Unknown device',
+              upgraded: true,
+            }),
+          )
 
           return { key_version: result.keyVersion, scheme_version: result.schemeVersion }
         } catch (err) {
@@ -1339,7 +1530,9 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
             }
             throw new Error('Bridge device registration returned no device')
           }
-          return { device }
+          // isNew distinguishes first registration from the re-registration
+          // upsert — only the former is a device GAINING access (THU-875 email).
+          return { device, isNew: !existingBridge }
         })
 
         if ('limitReached' in result) {
@@ -1351,6 +1544,12 @@ export const createEncryptionRoutes = (auth: Auth, database: typeof DbType, sett
           return { error: 'Bridge device revoked' }
         }
         const { device } = result
+        if (result.isNew) {
+          notifyBestEffort(
+            'bridge-connected',
+            notifications.sendBridgeConnected({ email: sessionUser!.email, deviceName: name }),
+          )
+        }
         return { id: device.id, nodeId: device.nodeId, deviceType: device.deviceType }
       },
       {

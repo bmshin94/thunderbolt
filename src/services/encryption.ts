@@ -107,6 +107,22 @@ import {
  * view of the keyring/devices/signing key was stale. Local state has already
  * been refreshed (`refreshAK`); the caller should simply retry the rotation.
  */
+/**
+ * Thrown when POST /encryption/rotate refuses a recovery re-anchor without a
+ * valid step-up code (THU-875). NOT staleness — local state is fine and nothing
+ * is refreshed; the caller re-prompts for the emailed code.
+ * `step_up_required`: no code accompanied the request. `step_up_invalid`: the
+ * code was wrong, expired, or burned its attempt budget.
+ */
+export class StepUpVerificationError extends Error {
+  code: 'step_up_required' | 'step_up_invalid'
+  constructor(code: 'step_up_required' | 'step_up_invalid', options?: ErrorOptions) {
+    super(`Recovery re-anchor refused: ${code}`, options)
+    this.name = 'StepUpVerificationError'
+    this.code = code
+  }
+}
+
 export class RotationStaleError extends Error {
   constructor(options?: ErrorOptions) {
     super('Key rotation state was stale — state refreshed, retry the rotation', options)
@@ -1212,6 +1228,12 @@ export type RotateAKOptions = {
   mintNewPrimary?: boolean
   /** Dependency seam for the synced-devices read (tests). */
   listTrustedDevices?: () => Promise<TrustedDevicePublicKeys[]>
+  /**
+   * Step-up verification code (THU-875) — required by the server when this
+   * rotation re-anchors the recovery slot to NEW keys (a phrase change). Silent
+   * rotations reuse the stored keys and never need one.
+   */
+  stepUpOtp?: string
 }
 
 /**
@@ -1343,8 +1365,17 @@ const runAKRotation = async (
       kdfSalt: recovery.kdfSalt,
       ...recoverySlot,
       orgEnvelope,
+      stepUpOtp: opts.stepUpOtp,
     })
   } catch (err) {
+    if (err instanceof HttpError && err.response.status === 403) {
+      // Step-up refusal (THU-875) is NOT staleness: local state is fine and a
+      // refresh would be noise — surface it so the caller prompts for the code.
+      const body = (await err.response.json().catch(() => null)) as { code?: string } | null
+      if (body?.code === 'step_up_required' || body?.code === 'step_up_invalid') {
+        throw new StepUpVerificationError(body.code, { cause: err })
+      }
+    }
     if (err instanceof HttpError && err.response.status >= 400 && err.response.status < 500) {
       // Stale local state (concurrent rotation / device change) — re-fetch our
       // envelope + keyring so the caller can rebuild and retry. This 4xx fires
@@ -1405,7 +1436,7 @@ export const rotateAccountKey = (httpClient: HttpClient, opts: RotateAKOptions =
  */
 export const changeRecoveryPhrase = async (
   httpClient: HttpClient,
-  opts: Pick<RotateAKOptions, 'listTrustedDevices'> = {},
+  opts: Pick<RotateAKOptions, 'listTrustedDevices' | 'stepUpOtp'> = {},
 ): Promise<string> => {
   const recovery = await mintRecoveryPlan()
   // Nothing to verify: this device minted the keys itself, so the served anchor

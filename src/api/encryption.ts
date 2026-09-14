@@ -222,6 +222,15 @@ export const postRotate = async (httpClient: HttpClient, body: RotateRequest): P
   httpClient.post('encryption/rotate', { json: body }).json<RotateResponse>()
 
 /**
+ * Ask the server to email a step-up code for a recovery-phrase change
+ * (THU-875). The server picks the address from the session and the code is
+ * consumed by the next `postRotate` that re-anchors the recovery slot.
+ */
+export const postStepUpRequest = async (httpClient: HttpClient): Promise<void> => {
+  await httpClient.post('encryption/step-up/request')
+}
+
+/**
  * v1→v2 migration (WS1): the migrator absorbs the legacy CK as the `"v1"` slot,
  * mints a fresh primary DEK `"0"`, registers the signing key + kdf_salt +
  * recovery slot, writes a new-AK envelope for every trusted device, and

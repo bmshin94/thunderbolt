@@ -20,6 +20,7 @@ import {
 import { expect, test } from './fixtures'
 import {
   completeFirstDeviceSetup,
+  completeStepUpCode,
   createE2eeEmail,
   createIsolatedDevice,
   createTask,
@@ -56,7 +57,10 @@ test.describe('PowerSync E2EE key rotation', () => {
     await page.getByRole('button', { name: 'Change Recovery Phrase' }).click()
     const confirmation = page.getByRole('alertdialog')
     await expect(confirmation.getByText('Change your recovery phrase?')).toBeVisible()
-    await confirmation.getByRole('button', { name: 'Generate new phrase' }).click()
+    // Phrase changes are step-up gated (THU-875): request the emailed code and
+    // enter it, the way a user with inbox access would.
+    await confirmation.getByRole('button', { name: 'Send code' }).click()
+    await completeStepUpCode(page, email)
 
     const recoveryDialog = page.getByRole('dialog').filter({ hasText: 'Save your new recovery phrase' })
     const newRecoveryPhrase = await readRecoveryPhrase(recoveryDialog)

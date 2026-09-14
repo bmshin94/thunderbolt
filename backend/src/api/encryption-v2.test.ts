@@ -20,6 +20,7 @@ import { createHmac } from 'crypto'
 import { and, eq } from 'drizzle-orm'
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { Elysia } from 'elysia'
+import type { SecurityNotifications } from '@/lib/security-notifications'
 import { createEncryptionRoutes } from './encryption'
 
 const baseUrl = 'http://localhost'
@@ -54,8 +55,32 @@ const hashSecret = async (secret: string): Promise<string> => {
 describe('Encryption API (v2)', () => {
   let app: ReturnType<typeof createEncryptionRoutes>
   let db: Awaited<ReturnType<typeof createTestDb>>['db']
+  let auth: ReturnType<typeof createAuth>
+  /** Every security email the routes attempted, in order (THU-875). */
+  let sentEmails: Array<{ kind: string; params: Record<string, unknown> }>
   let cleanup: () => Promise<void>
   let p: (id: string) => string
+
+  const recordEmail =
+    (kind: string) =>
+    async (params: Record<string, unknown>): Promise<void> => {
+      sentEmails.push({ kind, params })
+    }
+  const mockNotifications: SecurityNotifications = {
+    sendStepUpCode: recordEmail('step-up-code'),
+    sendRecoveryPhraseChanged: recordEmail('recovery-phrase-changed'),
+    sendDeviceApproved: recordEmail('device-approved'),
+    sendRecoveryPhraseUsed: recordEmail('recovery-phrase-used'),
+    sendBridgeConnected: recordEmail('bridge-connected'),
+    sendEncryptionSetUp: recordEmail('encryption-set-up'),
+  }
+
+  /** Mint a step-up code server-side, exactly as `POST /encryption/step-up/request` does. */
+  const mintStepUpOtp = (userId: string): Promise<string> =>
+    auth.api.createVerificationOTP({ body: { email: `${userId}@test.com`, type: 'email-verification' } })
+
+  /** Notifications are fired post-response via a floating promise — let it settle. */
+  const flushNotifications = () => new Promise((resolve) => setTimeout(resolve, 0))
 
   const now = new Date()
   const expiresAt = new Date(now.getTime() + 3600 * 1000)
@@ -193,10 +218,11 @@ describe('Encryption API (v2)', () => {
     const testEnv = await createTestDb()
     db = testEnv.db
     cleanup = testEnv.cleanup
-    const auth = createAuth(db)
-    app = new Elysia().use(createEncryptionRoutes(auth, db, createTestSettings())) as unknown as ReturnType<
-      typeof createEncryptionRoutes
-    >
+    auth = createAuth(db)
+    sentEmails = []
+    app = new Elysia().use(
+      createEncryptionRoutes(auth, db, createTestSettings(), mockNotifications),
+    ) as unknown as ReturnType<typeof createEncryptionRoutes>
   })
 
   afterEach(async () => {
@@ -1018,15 +1044,17 @@ describe('Encryption API (v2)', () => {
       expect(metadata.recoveryWrappedAk).toBe('recovery-wrapped-new-ak')
     })
 
-    it('accepts CHANGED recovery public keys — that is an explicit phrase change', async () => {
+    it('accepts CHANGED recovery public keys WITH a valid step-up code — an explicit phrase change (THU-875)', async () => {
       const keypair = await setupRotatable([initialKeyId])
       const body = await rotateBody(keypair, [initialKeyId])
+      const otp = await mintStepUpOtp(p('u'))
       const res = await app.handle(
         new Request(`${baseUrl}/encryption/rotate`, {
           method: 'POST',
           headers: authHeaders(p('tok'), p('caller')),
           body: JSON.stringify({
             ...body,
+            stepUpOtp: otp,
             recoveryEcdhPublicKey: 'fresh-phrase-ecdh',
             recoveryMlkemPublicKey: 'fresh-phrase-mlkem',
             recoveryWrappedAK: 'fresh-phrase-wrapped-ak',
@@ -1042,6 +1070,80 @@ describe('Encryption API (v2)', () => {
       expect(metadata.recoveryEcdhPublicKey).toBe('fresh-phrase-ecdh')
       expect(metadata.recoveryMlkemPublicKey).toBe('fresh-phrase-mlkem')
       expect(metadata.recoveryWrappedAk).toBe('fresh-phrase-wrapped-ak')
+
+      // The commit notified out-of-band and consumed the code.
+      await flushNotifications()
+      expect(sentEmails.map((e) => e.kind)).toContain('recovery-phrase-changed')
+    })
+
+    it('refuses CHANGED recovery keys without a step-up code — and nothing moves (THU-875)', async () => {
+      const keypair = await setupRotatable([initialKeyId])
+      const body = await rotateBody(keypair, [initialKeyId])
+      const res = await app.handle(
+        new Request(`${baseUrl}/encryption/rotate`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('caller')),
+          body: JSON.stringify({ ...body, recoveryEcdhPublicKey: 'attacker-ecdh' }),
+        }),
+      )
+      expect(res.status).toBe(403)
+      expect((await res.json()).code).toBe('step_up_required')
+
+      const [metadata] = await db
+        .select()
+        .from(encryptionMetadataTable)
+        .where(eq(encryptionMetadataTable.userId, p('u')))
+      expect(metadata.recoveryEcdhPublicKey).not.toBe('attacker-ecdh')
+      expect(sentEmails).toEqual([])
+    })
+
+    it('refuses a wrong step-up code (THU-875)', async () => {
+      const keypair = await setupRotatable([initialKeyId])
+      const body = await rotateBody(keypair, [initialKeyId])
+      await mintStepUpOtp(p('u'))
+      const res = await app.handle(
+        new Request(`${baseUrl}/encryption/rotate`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('caller')),
+          body: JSON.stringify({ ...body, stepUpOtp: '00000000', recoveryEcdhPublicKey: 'attacker-ecdh' }),
+        }),
+      )
+      expect(res.status).toBe(403)
+      expect((await res.json()).code).toBe('step_up_invalid')
+    })
+
+    it('consumes the step-up code on commit — replay is refused (THU-875)', async () => {
+      const keypair = await setupRotatable([initialKeyId])
+      const body = await rotateBody(keypair, [initialKeyId])
+      const otp = await mintStepUpOtp(p('u'))
+      const first = await app.handle(
+        new Request(`${baseUrl}/encryption/rotate`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('caller')),
+          body: JSON.stringify({
+            ...body,
+            stepUpOtp: otp,
+            recoveryEcdhPublicKey: 'fresh-phrase-ecdh',
+          }),
+        }),
+      )
+      expect(first.status).toBe(200)
+
+      // Second phrase change re-using the consumed code must be refused.
+      const retryBody = await rotateBody(keypair, [initialKeyId])
+      const replay = await app.handle(
+        new Request(`${baseUrl}/encryption/rotate`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('caller')),
+          body: JSON.stringify({
+            ...retryBody,
+            stepUpOtp: otp,
+            recoveryEcdhPublicKey: 'attacker-ecdh',
+          }),
+        }),
+      )
+      expect(replay.status).toBe(403)
+      expect((await replay.json()).code).toBe('step_up_invalid')
     })
 
     it.each(['recoveryEcdhPublicKey', 'recoveryMlkemPublicKey', 'recoveryWrappedAK', 'recoveryAttestation'] as const)(
@@ -1806,6 +1908,148 @@ describe('Encryption API (v2)', () => {
 
       expect(res.status).toBe(200)
       expect(await sessionDeviceId()).toBeNull()
+    })
+  })
+
+  // ─── Security notifications + step-up request (THU-875) ─────────────
+
+  describe('security notifications (THU-875)', () => {
+    it('emails device-approved (with both device names) when an approval flips trusted', async () => {
+      const keypair = await generateSigningKeypair()
+      await createUserAndSession(p('u'), p('tok'), p('caller'))
+      await insertV2Metadata(p('u'), await exportSigningPublicKey(keypair))
+      await insertDevice(p('caller'), p('u'), { trusted: true })
+      await insertEnvelope(p('caller'), p('u'))
+      await insertDevice(p('target'), p('u'))
+
+      const proof = await proofFor(p('tok'), p('caller'), 'approve', keypair)
+      const response = await app.handle(
+        new Request(`${baseUrl}/devices/${p('target')}/envelope`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('caller')),
+          body: JSON.stringify({ wrappedCK: 'target-ak', proof }),
+        }),
+      )
+      expect(response.status).toBe(200)
+
+      await flushNotifications()
+      expect(sentEmails.map((e) => e.kind)).toEqual(['device-approved'])
+      expect(sentEmails[0]!.params.email).toBe(`${p('u')}@test.com`)
+    })
+
+    it('emails recovery-phrase-used when a device self-approves (recovery flow)', async () => {
+      const keypair = await generateSigningKeypair()
+      await createUserAndSession(p('u'), p('tok'), p('target'))
+      await insertV2Metadata(p('u'), await exportSigningPublicKey(keypair))
+      await insertDevice(p('target'), p('u'))
+
+      const proof = await proofFor(p('tok'), p('target'), 'approve', keypair)
+      const response = await app.handle(
+        new Request(`${baseUrl}/devices/${p('target')}/envelope`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('target')),
+          body: JSON.stringify({ wrappedCK: 'self-ak', proof }),
+        }),
+      )
+      expect(response.status).toBe(200)
+
+      await flushNotifications()
+      expect(sentEmails.map((e) => e.kind)).toEqual(['recovery-phrase-used'])
+    })
+
+    it('does NOT email when an already-trusted device re-keys its own envelope', async () => {
+      const keypair = await generateSigningKeypair()
+      await createUserAndSession(p('u'), p('tok'), p('d'))
+      await insertV2Metadata(p('u'), await exportSigningPublicKey(keypair))
+      await insertDevice(p('d'), p('u'), { trusted: true })
+      await insertEnvelope(p('d'), p('u'))
+
+      const proof = await proofFor(p('tok'), p('d'), 'approve', keypair)
+      const response = await app.handle(
+        new Request(`${baseUrl}/devices/${p('d')}/envelope`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('d')),
+          body: JSON.stringify({ wrappedCK: 're-keyed-ak', proof }),
+        }),
+      )
+      expect(response.status).toBe(200)
+
+      await flushNotifications()
+      expect(sentEmails).toEqual([])
+    })
+
+    it('emails bridge-connected on FIRST bridge registration only', async () => {
+      await createUserAndSession(p('u'), p('tok'))
+
+      const register = () =>
+        app.handle(
+          new Request(`${baseUrl}/devices/bridge`, {
+            method: 'POST',
+            headers: authHeaders(p('tok')),
+            body: JSON.stringify({ nodeId: 'node-abc', name: 'Home server' }),
+          }),
+        )
+      expect((await register()).status).toBe(200)
+      expect((await register()).status).toBe(200)
+
+      await flushNotifications()
+      expect(sentEmails.map((e) => e.kind)).toEqual(['bridge-connected'])
+      expect(sentEmails[0]!.params.deviceName).toBe('Home server')
+    })
+  })
+
+  describe('POST /encryption/step-up/request (THU-875)', () => {
+    it('mints a code and emails it with the requesting device name', async () => {
+      const keypair = await generateSigningKeypair()
+      await createUserAndSession(p('u'), p('tok'), p('d'))
+      await insertV2Metadata(p('u'), await exportSigningPublicKey(keypair))
+      await insertDevice(p('d'), p('u'), { trusted: true })
+
+      const res = await app.handle(
+        new Request(`${baseUrl}/encryption/step-up/request`, {
+          method: 'POST',
+          headers: authHeaders(p('tok'), p('d')),
+        }),
+      )
+      expect(res.status).toBe(200)
+      expect(sentEmails.map((e) => e.kind)).toEqual(['step-up-code'])
+      const { code, email } = sentEmails[0]!.params as { code: string; email: string }
+      expect(email).toBe(`${p('u')}@test.com`)
+      expect(code.length).toBeGreaterThan(0)
+
+      // And the minted code actually opens the rotate gate: verified end-to-end
+      // by the rotate suite; here just confirm the row exists via a check call.
+      const { success } = await auth.api.checkVerificationOTP({
+        body: { email: `${p('u')}@test.com`, type: 'email-verification', otp: code },
+      })
+      expect(success).toBe(true)
+    })
+
+    it('cools down repeat requests (429) and refuses untrusted devices (403)', async () => {
+      const keypair = await generateSigningKeypair()
+      await createUserAndSession(p('u'), p('tok'), p('d'))
+      await insertV2Metadata(p('u'), await exportSigningPublicKey(keypair))
+      await insertDevice(p('d'), p('u'), { trusted: true })
+
+      const request = () =>
+        app.handle(
+          new Request(`${baseUrl}/encryption/step-up/request`, {
+            method: 'POST',
+            headers: authHeaders(p('tok'), p('d')),
+          }),
+        )
+      expect((await request()).status).toBe(200)
+      expect((await request()).status).toBe(429)
+
+      await createUserAndSession(p('u2'), p('tok2'), p('d2'))
+      await insertDevice(p('d2'), p('u2'))
+      const untrusted = await app.handle(
+        new Request(`${baseUrl}/encryption/step-up/request`, {
+          method: 'POST',
+          headers: authHeaders(p('tok2'), p('d2')),
+        }),
+      )
+      expect(untrusted.status).toBe(403)
     })
   })
 })

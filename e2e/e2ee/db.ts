@@ -60,6 +60,24 @@ export const getCurrentOtp = async (email: string): Promise<string | null> => {
   return rows[0]?.value ?? null
 }
 
+/**
+ * Step-up code for a recovery-phrase change (THU-875). Dev/e2e sends no email,
+ * so specs read the code where the inbox would — better-auth's verification
+ * table. `value` is stored as `otp:attempts`.
+ */
+export const waitForStepUpOtp = async (email: string): Promise<string> =>
+  poll(async () => {
+    const rows = await sql<{ value: string }[]>`
+      SELECT value
+      FROM verification
+      WHERE identifier = ${`email-verification-otp-${email}`}
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `
+    const value = rows[0]?.value
+    return value ? value.split(':')[0]! : null
+  })
+
 export const waitForUserId = async (email: string): Promise<string> =>
   poll(async () => {
     const rows = await sql<{ id: string }[]>`

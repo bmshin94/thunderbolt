@@ -14,6 +14,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { RecoveryKeyDialog } from '@/components/recovery-key-dialog'
+import { StepUpCodeDialog } from '@/components/step-up-code-dialog'
 import { useRecoveryPhrasePending } from '@/lib/recovery-phrase-pending'
 import { useChangeRecoveryKey } from '@/settings/encryption/use-change-recovery-key'
 
@@ -34,7 +35,8 @@ import { useChangeRecoveryKey } from '@/settings/encryption/use-change-recovery-
 export const UnsavedRecoveryPhrasePrompt = () => {
   const pending = useRecoveryPhrasePending()
   const [dismissed, setDismissed] = useState(false)
-  const { status, newRecoveryKey, isRotating, error, confirmRotation, done } = useChangeRecoveryKey()
+  const { status, newRecoveryKey, isBusy, otp, error, setOtp, requestStepUpCode, confirmRotation, cancel, done } =
+    useChangeRecoveryKey()
 
   /**
    * Snapshot at mount, so this only ever speaks for a phrase left unacknowledged
@@ -47,13 +49,13 @@ export const UnsavedRecoveryPhrasePrompt = () => {
    */
   const [wasPendingAtStartup] = useState(pending)
 
-  if ((!wasPendingAtStartup || !pending) && status !== 'display') {
+  if ((!wasPendingAtStartup || !pending) && status !== 'display' && status !== 'stepUp') {
     return null
   }
 
   return (
     <>
-      <AlertDialog open={wasPendingAtStartup && pending && !dismissed && status !== 'display'}>
+      <AlertDialog open={wasPendingAtStartup && pending && !dismissed && status !== 'display' && status !== 'stepUp'}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Your recovery phrase was never saved</AlertDialogTitle>
@@ -69,15 +71,28 @@ export const UnsavedRecoveryPhrasePrompt = () => {
             </p>
           )}
           <AlertDialogFooter>
-            <Button variant="ghost" onClick={() => setDismissed(true)} disabled={isRotating}>
+            <Button variant="ghost" onClick={() => setDismissed(true)} disabled={isBusy}>
               Later
             </Button>
-            <AlertDialogAction onClick={confirmRotation} disabled={isRotating}>
-              {isRotating ? 'Generating…' : 'Generate a new phrase'}
+            {/* Phrase changes are step-up-gated (THU-875): email a code first,
+                then StepUpCodeDialog below runs the gated rotation. */}
+            <AlertDialogAction onClick={requestStepUpCode} disabled={isBusy}>
+              {isBusy ? 'Sending code…' : 'Generate a new phrase'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <StepUpCodeDialog
+        open={status === 'stepUp'}
+        otp={otp}
+        isBusy={isBusy}
+        error={error}
+        onOtpChange={setOtp}
+        onResend={requestStepUpCode}
+        onSubmit={confirmRotation}
+        onCancel={cancel}
+      />
 
       <RecoveryKeyDialog
         open={status === 'display'}

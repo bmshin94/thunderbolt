@@ -15,11 +15,12 @@ export const bridgeDeviceIdPrefix = 'bridge-'
 export const bridgeDeviceId = (userId: string, nodeId: string) =>
   `${bridgeDeviceIdPrefix}${createHash('sha256').update(`${userId}:${nodeId}`).digest('hex')}`
 
-/** Get a device by ID. Returns userId, trusted, approvalPending, publicKey, and revokedAt, or null if not found. */
+/** Get a device by ID. Returns userId, name, trusted, approvalPending, publicKey, and revokedAt, or null if not found. */
 export const getDeviceById = async (database: QueryableDatabase, deviceId: string) =>
   database
     .select({
       userId: devicesTable.userId,
+      name: devicesTable.name,
       trusted: devicesTable.trusted,
       approvalPending: devicesTable.approvalPending,
       publicKey: devicesTable.publicKey,
