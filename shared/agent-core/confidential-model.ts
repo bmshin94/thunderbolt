@@ -19,8 +19,13 @@ import { inferenceUsageReceiptHeader, type InferenceUsageReceiptRequest } from '
 import { buildOpenAiCompatModel, type OpenAiCompatFetch } from './openai-compat-model.ts'
 
 const vendorAliases = { zhipu: 'zai' } as const
-// pi-ai 0.80.7 has no glm-5.3; swap the alias for the real catalog id when upgrading Pi
-const modelAliases = { 'glm-5-2': 'glm-5.2', 'glm-5-3': 'glm-5.2', 'glm-5-3-flash': 'glm-5.2' } as const
+// pi-ai 0.80.7 has no glm-5.3 or deepseek-v4-1-flash; swap the aliases for the real catalog ids when upgrading Pi
+const modelAliases = {
+  'glm-5-2': 'glm-5.2',
+  'glm-5-3': 'glm-5.2',
+  'glm-5-3-flash': 'glm-5.2',
+  'deepseek-v4-1-flash': 'deepseek-v4-flash',
+} as const
 
 /** Stable structural codes surfaced by confidential model construction and transport. */
 export type ConfidentialModelErrorCode = 'compatibility-missing' | 'attestation-failed'

@@ -3,16 +3,18 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import type { ModelProfile } from '@/types'
-import { defaultModelGlm53Flash } from '@shared/defaults/models'
+import { defaultModelDeepseekV41Flash } from '@shared/defaults/models'
 
-export const defaultModelProfileGlm53Flash: ModelProfile = {
-  modelId: defaultModelGlm53Flash.id,
+export const defaultModelProfileDeepseekV41Flash: ModelProfile = {
+  modelId: defaultModelDeepseekV41Flash.id,
   temperature: 0.2,
   maxSteps: 20,
   maxAttempts: 2,
   nudgeThreshold: 6,
   useSystemMessageModeDeveloper: 0,
-  providerOptions: { reasoningEffort: 'low' },
+  // Pi's deepseek thinking map has no low/medium levels, so no reasoningEffort:
+  // Flash runs non-reasoning, matching the pre-V6 DeepSeek Flash profile.
+  providerOptions: null,
   toolsOverride: null,
   linkPreviewsOverride: null,
   chatModeAddendum: null,

@@ -45,7 +45,8 @@ export type SharedModel = {
  */
 export const imageCapableVendors: ReadonlySet<string> = new Set(['anthropic', 'openai', 'google'])
 
-const imageCapableModels = new Set(['glm-5-3-flash'])
+// glm-5-3-flash stays listed for rows not yet migrated to deepseek-v4-1-flash.
+const imageCapableModels = new Set(['deepseek-v4-1-flash', 'glm-5-3-flash'])
 
 /** Whether a model accepts images based on its vendor or known model slug. */
 export const modelSupportsImages = ({ vendor, model }: Pick<SharedModel, 'vendor' | 'model'>): boolean =>
@@ -102,11 +103,11 @@ export const defaultModelOpus5: SharedModel = {
   userId: null,
 }
 
-export const defaultModelGlm53Flash: SharedModel = {
+export const defaultModelDeepseekV41Flash: SharedModel = {
   id: '01a06dd7-67ee-75be-b957-2b746271c49d',
-  name: 'GLM 5.3 Flash',
+  name: 'DeepSeek V4.1 Flash',
   provider: 'tinfoil',
-  model: 'glm-5-3-flash',
+  model: 'deepseek-v4-1-flash',
   isSystem: 1,
   enabled: 1,
   isConfidential: 1,
@@ -117,12 +118,12 @@ export const defaultModelGlm53Flash: SharedModel = {
   deletedAt: null,
   url: null,
   defaultHash: null,
-  vendor: 'zhipu',
+  vendor: 'deepseek',
   description: 'Fast, low-cost confidential chat with image support',
   userId: null,
 }
 
-export const defaultModelId = defaultModelGlm53Flash.id
+export const defaultModelId = defaultModelDeepseekV41Flash.id
 
 export const defaultModelGlm53: SharedModel = {
   id: '019e7580-2b0e-719c-a43f-d2b56e7f31b4',
@@ -159,11 +160,14 @@ export const defaultModelGlm53: SharedModel = {
  * Retired in V5: direct Flash (`019f227e-d640-727d-ba12-d51bd7d0a3d6`),
  * replaced by confidential Flash under a fresh id with the same cleanup policy.
  * Retired slugs in V6: `glm-5-2` and `deepseek-v4-flash`, upgraded in place.
- * The backend continues accepting both slugs for legacy clients.
+ * Retired slug in V7: `glm-5-3-flash`, upgraded in place to `deepseek-v4-1-flash`
+ * (Tinfoil retires `deepseek-v4-flash` on 2026-09-15 and recommends V4.1 Flash
+ * over GLM 5.3 Flash as the confidential flash tier).
+ * The backend continues accepting all retired slugs for legacy clients.
  */
 export const defaultModels: ReadonlyArray<SharedModel> = [
   defaultModelOpus5,
-  defaultModelGlm53Flash,
+  defaultModelDeepseekV41Flash,
   defaultModelGlm53,
 ] as const
 
@@ -177,4 +181,4 @@ export const defaultModels: ReadonlyArray<SharedModel> = [
  * The paired snapshot test in `models.test.ts` fails on any change to this
  * file's defaults without a matching version bump.
  */
-export const defaultModelsVersion = 6
+export const defaultModelsVersion = 7

@@ -218,6 +218,13 @@
       "when": 1789155227424,
       "tag": "0030_debug_transcripts",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1789232023004,
+      "tag": "0031_seed-deepseek-v4-1-flash-price",
+      "breakpoints": true
     }
   ]
 }

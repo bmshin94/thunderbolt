@@ -127,6 +127,7 @@ describe('buildConfidentialModel compatibility', () => {
     ['GLM 5.3', 'glm-5-3', 'zhipu', { type: 'enabled', clear_thinking: false }, 'max'],
     ['GLM 5.3 Flash', 'glm-5-3-flash', 'zhipu', { type: 'enabled', clear_thinking: false }, 'low'],
     ['DeepSeek V4 Flash', 'deepseek-v4-flash', 'deepseek', { type: 'enabled' }, 'high'],
+    ['DeepSeek V4.1 Flash', 'deepseek-v4-1-flash', 'deepseek', { type: 'enabled' }, 'high'],
   ] as const)(
     'uses catalog-driven Pi thinking metadata for %s',
     async (_name, modelId, vendor, thinking, reasoning) => {

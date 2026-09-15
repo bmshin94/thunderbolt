@@ -5,7 +5,7 @@
 import { describe, expect, test } from 'bun:test'
 import { hashValues } from '../lib/hash'
 import {
-  defaultModelGlm53Flash,
+  defaultModelDeepseekV41Flash,
   defaultModelGlm53,
   defaultModelId,
   defaultModelOpus5,
@@ -38,24 +38,24 @@ const computeMetadataHash = () =>
   defaultModels.map((model, index) => `${index}:${hashValues([model.vendor, model.description])}`).join('|')
 
 const expected = {
-  version: 6,
-  hash: '0:019af08a-c27b-7074-8aac-95315d1ef3fd:n56kdk|1:01a06dd7-67ee-75be-b957-2b746271c49d:-n92e4|2:019e7580-2b0e-719c-a43f-d2b56e7f31b4:-mx717t',
-  metadataHash: '0:vzhyk4|1:d17qpa|2:-cajkcl',
+  version: 7,
+  hash: '0:019af08a-c27b-7074-8aac-95315d1ef3fd:n56kdk|1:01a06dd7-67ee-75be-b957-2b746271c49d:-1atscs|2:019e7580-2b0e-719c-a43f-d2b56e7f31b4:-mx717t',
+  metadataHash: '0:vzhyk4|1:1sqs5u|2:-cajkcl',
 }
 
 describe('defaultModels version snapshot', () => {
   test('selects confidential Flash by default', () => {
-    expect(defaultModelId).toBe(defaultModelGlm53Flash.id)
+    expect(defaultModelId).toBe(defaultModelDeepseekV41Flash.id)
   })
 
   test('preserves the confidential Flash row identity', () => {
-    expect(defaultModelGlm53Flash).toMatchObject({
+    expect(defaultModelDeepseekV41Flash).toMatchObject({
       id: '01a06dd7-67ee-75be-b957-2b746271c49d',
       provider: 'tinfoil',
-      model: 'glm-5-3-flash',
+      model: 'deepseek-v4-1-flash',
       isSystem: 1,
       isConfidential: 1,
-      vendor: 'zhipu',
+      vendor: 'deepseek',
       contextWindow: 131072,
       toolUsage: 1,
       supportsParallelToolCalls: 0,
@@ -99,9 +99,13 @@ describe('defaultModels version snapshot', () => {
 })
 
 describe('modelSupportsImages', () => {
-  test('supports images for GLM 5.3 Flash but not GLM 5.3', () => {
-    expect(modelSupportsImages(defaultModelGlm53Flash)).toBe(true)
+  test('supports images for DeepSeek V4.1 Flash but not GLM 5.3', () => {
+    expect(modelSupportsImages(defaultModelDeepseekV41Flash)).toBe(true)
     expect(modelSupportsImages(defaultModelGlm53)).toBe(false)
+  })
+
+  test('keeps image support for un-migrated GLM 5.3 Flash rows', () => {
+    expect(modelSupportsImages({ vendor: 'zhipu', model: 'glm-5-3-flash' })).toBe(true)
   })
 
   test('true for known vision vendors', () => {

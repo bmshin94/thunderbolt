@@ -39,7 +39,7 @@ const workflowCommentAuthor = 'github-actions[bot]'
 const failureDisplayLimit = 20
 const modelDisplayNames: Readonly<Record<string, string>> = {
   opus: 'Opus 5',
-  flash: 'GLM 5.3 Flash',
+  flash: 'DeepSeek V4.1 Flash',
   glm: 'GLM 5.3',
 }
 const expectationByCategory: Readonly<Record<NecessityCategory, string>> = {

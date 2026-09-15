@@ -5,8 +5,8 @@
 import type { AnyDrizzleDatabase } from '@/db/database-interface'
 import { modelsTable } from '@/db/tables'
 import {
+  defaultModelDeepseekV41Flash,
   defaultModelGlm53,
-  defaultModelGlm53Flash,
   defaultModelOpus5,
   hashModel,
   type SharedModel,
@@ -27,9 +27,9 @@ const modelLineages = [
     legacyNames: ['GLM 5.1', 'GLM 5.2'],
   },
   {
-    target: defaultModelGlm53Flash,
-    legacySlugs: ['deepseek-v4-flash'],
-    legacyNames: ['DeepSeek V4 Flash'],
+    target: defaultModelDeepseekV41Flash,
+    legacySlugs: ['deepseek-v4-flash', 'glm-5-3-flash'],
+    legacyNames: ['DeepSeek V4 Flash', 'GLM 5.3 Flash'],
   },
 ]
 
@@ -45,7 +45,7 @@ export const normalizeModelDefault = (model: SharedModel): SharedModel => {
     model: lineage.target.model,
     name: lineage.legacyNames.includes(model.name) ? lineage.target.name : model.name,
     // vendor/description are server-owned metadata (outside the edit hash). A
-    // lineage that changes vendor (deepseek → zhipu for Flash) must carry it, or
+    // lineage that changes vendor (zhipu → deepseek for Flash) must carry it, or
     // the reused row resolves Pi compatibility against the stale vendor and every
     // send throws compatibility-missing. Reconcile already does this for intact
     // rows; edited rows only pass through here.
