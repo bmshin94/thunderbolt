@@ -6,15 +6,36 @@ import type { StoredFile } from '@/lib/file-blob-storage'
 import { sourceLocale } from '@shared/i18n/locales'
 import type { CellValue } from 'read-excel-file/browser'
 
-/** Renders one cell as plain text. Dates format against the model-facing
- *  English locale, matching how the rest of the app renders dates for the
- *  model rather than the user (see `src/ai/prompt.ts`). */
+/**
+ * Renders a spreadsheet date as the calendar date (and time, when it has one)
+ * written in the cell. Spreadsheets store dates without a timezone and
+ * read-excel-file represents them as UTC, so formatting in UTC reproduces the
+ * cell exactly; formatting in local time would shift the day for anyone west of
+ * Greenwich. Uses the model-facing English locale (see `src/ai/prompt.ts`).
+ */
+const formatSpreadsheetDate = (value: Date): string => {
+  const hasTime = value.getUTCHours() !== 0 || value.getUTCMinutes() !== 0 || value.getUTCSeconds() !== 0
+  if (!hasTime) {
+    return value.toLocaleDateString(sourceLocale, { timeZone: 'UTC' })
+  }
+  return value.toLocaleString(sourceLocale, {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    ...(value.getUTCSeconds() !== 0 && { second: '2-digit' }),
+  })
+}
+
+/** Renders one cell as plain text. */
 const cellText = (value: CellValue | null): string => {
   if (value === null) {
     return ''
   }
   if (value instanceof Date) {
-    return value.toLocaleDateString(sourceLocale)
+    return formatSpreadsheetDate(value)
   }
   return String(value)
 }

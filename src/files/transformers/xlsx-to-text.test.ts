@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-import { describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
 import type { StoredFile } from '@/lib/file-blob-storage'
 
 const readXlsxFile = mock(async () => [] as { sheet: string; data: unknown[][] }[])
@@ -67,11 +67,46 @@ describe('xlsxToText', () => {
     })
   })
 
-  test('formats a date cell against the model-facing English locale', async () => {
-    readXlsxFile.mockImplementationOnce(async () => [
-      { sheet: 'Sheet1', data: [['Shipped', new Date(Date.UTC(2026, 0, 15))]] },
-    ])
+  // `bun test` runs in UTC, which hides timezone bugs: read-excel-file hands back
+  // spreadsheet dates as UTC midnight, so formatting them in local time shifts the
+  // day for anyone west of Greenwich. Pin a western zone for these cases.
+  describe('dates, viewed from a timezone west of UTC', () => {
+    const originalTimeZone = process.env.TZ
 
-    expect(await xlsxToText(asFile())).toEqual({ text: '## Sheet: Sheet1\nShipped, 1/15/2026' })
+    beforeAll(() => {
+      process.env.TZ = 'America/Halifax'
+    })
+
+    afterAll(() => {
+      // `bun test` defaults to UTC without setting TZ, and assigning undefined back
+      // drops the process into the machine's local zone for every later test file.
+      process.env.TZ = originalTimeZone ?? 'UTC'
+    })
+
+    test('keeps the calendar day written in the sheet', async () => {
+      readXlsxFile.mockImplementationOnce(async () => [
+        { sheet: 'Sheet1', data: [['Shipped', new Date(Date.UTC(2026, 7, 1))]] },
+      ])
+
+      expect(await xlsxToText(asFile())).toEqual({ text: '## Sheet: Sheet1\nShipped, 8/1/2026' })
+    })
+
+    test('keeps the time of day when the cell has one', async () => {
+      readXlsxFile.mockImplementationOnce(async () => [
+        { sheet: 'Sheet1', data: [['Logged', new Date(Date.UTC(2026, 8, 1, 14, 30))]] },
+      ])
+
+      const { text } = await xlsxToText(asFile())
+      expect(text).toMatch(/^## Sheet: Sheet1\nLogged, "9\/1\/2026, 2:30\sPM"$/u)
+    })
+
+    test('includes seconds only when they are not zero', async () => {
+      readXlsxFile.mockImplementationOnce(async () => [
+        { sheet: 'Sheet1', data: [['Logged', new Date(Date.UTC(2026, 8, 1, 14, 30, 15))]] },
+      ])
+
+      const { text } = await xlsxToText(asFile())
+      expect(text).toMatch(/"9\/1\/2026, 2:30:15\sPM"$/u)
+    })
   })
 })
