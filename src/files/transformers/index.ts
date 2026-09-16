@@ -31,6 +31,9 @@ export type TransformerKey = `${string}->${TransformTarget}`
 /** MIME type for `.docx` (OOXML Word documents). */
 export const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
+/** MIME type for `.xlsx` (OOXML spreadsheets). */
+export const xlsxMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
 /**
  * True for files that are already text (CSV, plain text, Markdown, JSON, logs…).
  * These get a passthrough text transformer (so any `text/*` type works without
@@ -89,6 +92,7 @@ const loaders: Partial<Record<TransformerKey, () => Promise<Transformer>>> = {
   'application/pdf->text': async () => (await import('./pdf-to-text')).pdfToText,
   [`${docxMime}->text`]: async () => (await import('./docx-to-text')).docxToText,
   'application/pdf->images': async () => (await import('./pdf-to-images')).pdfToImages,
+  [`${xlsxMime}->text`]: async () => (await import('./xlsx-to-text')).xlsxToText,
 }
 
 /** True if a transformer exists for this source MIME → target. Sync, for routing decisions. */
