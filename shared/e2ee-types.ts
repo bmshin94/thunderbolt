@@ -252,6 +252,20 @@ export const encodeAAD = (table: string, column: string, rowId: string, keyId: K
 export const canaryAAD = (userId: string, keyId: KeyId): Uint8Array => encodeAAD('__meta', 'canary', userId, keyId)
 
 /**
+ * The canary's AAD anchor tag (THU-872): the canary seed is wrapped under the
+ * ACCOUNT KEY, not under any DEK, so its AAD names this reserved tag instead of
+ * a key_id. Outside `keyIdPattern` by construction, so no mintable key_id can
+ * ever collide with it, and disjoint from the v1-era `'0'` anchor — an old
+ * DEK-anchored canary can never be replayed as an AK-anchored one.
+ *
+ * WHY THE AK: the AK is replaced on every rotation and is never delivered to a
+ * revoked device, so anchoring the seed here is what makes the signing identity
+ * epoch-fresh — a revoked device's retained DEK "0" no longer derives the
+ * current signing key.
+ */
+export const akCanaryAnchor = '__ak' as const
+
+/**
  * AAD binding a wrapped DEK to its `key_id` (THU-893). A keyring row's blob is
  * AES-GCM-wrapped under the AK with this AAD, so the label the key was CREATED
  * under and the label it is USED as must agree — enforced by the cipher, on

@@ -3,70 +3,73 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'bun:test'
-import { canaryAAD, ecdsaKeyAlgorithm, ecdsaSignAlgorithm, encodeChallengePayload } from '@shared/e2ee-types'
+import { ecdsaKeyAlgorithm, ecdsaSignAlgorithm, encodeChallengePayload } from '@shared/e2ee-types'
 
 import {
-  createCanary,
-  verifyCanary,
+  mintCanary,
+  unwrapCanaryKey,
   recoverCanarySecretV1,
   deriveSigningKeyPair,
   signChallenge,
   signRecoveryAttestation,
   verifyRecoveryAttestation,
 } from './canary'
-import { base64ToUint8Array, decrypt, encrypt, generateDEK } from './primitives'
+import { base64ToUint8Array, encrypt, generateAK, generateDEK } from './primitives'
 
 const userId = 'user-123'
-const keyId = '0'
 
-describe('createCanary', () => {
-  it('returns canaryIv, canaryCtext, and a 64-hex-char secret', async () => {
-    const canary = await createCanary(await generateDEK(), userId, keyId)
+/** A deterministic HKDF canary key from a fixed seed string (epoch stand-in). */
+const canaryKeyFromSeed = (seed: string): Promise<CryptoKey> =>
+  crypto.subtle.importKey('raw', new TextEncoder().encode(seed), 'HKDF', false, ['deriveBits', 'deriveKey'])
+
+describe('mintCanary / unwrapCanaryKey (THU-872 — AK-anchored)', () => {
+  it('returns base64 iv/ctext and a non-extractable HKDF key handle', async () => {
+    const ak = await generateAK()
+    const canary = await mintCanary(ak, userId)
     expect(typeof canary.canaryIv).toBe('string')
     expect(typeof canary.canaryCtext).toBe('string')
-    expect(canary.canarySecret).toMatch(/^[0-9a-f]{64}$/)
+    expect(canary.canaryKey.algorithm.name).toBe('HKDF')
+    expect(canary.canaryKey.extractable).toBe(false)
   })
 
-  it('generates unique secrets each time', async () => {
-    const dek = await generateDEK()
-    const c1 = await createCanary(dek, userId, keyId)
-    const c2 = await createCanary(dek, userId, keyId)
-    expect(c1.canarySecret).not.toBe(c2.canarySecret)
+  it('mints a fresh seed each time — two canaries under one AK derive different signing keys', async () => {
+    const ak = await generateAK()
+    const c1 = await mintCanary(ak, userId)
+    const c2 = await mintCanary(ak, userId)
+    expect(c1.canaryCtext).not.toBe(c2.canaryCtext)
+    const kp1 = await deriveSigningKeyPair(c1.canaryKey)
+    const kp2 = await deriveSigningKeyPair(c2.canaryKey)
+    expect(kp1.publicKeySpki).not.toBe(kp2.publicKeySpki)
   })
 
-  it('binds canaryAAD(userId, keyId) — decrypts only with that exact AAD', async () => {
-    const dek = await generateDEK()
-    const canary = await createCanary(dek, userId, keyId)
-    const data = { iv: canary.canaryIv, ciphertext: canary.canaryCtext }
-
-    await expect(decrypt(data, dek)).rejects.toThrow('Failed to decrypt')
-    await expect(decrypt(data, dek, canaryAAD(userId, '1'))).rejects.toThrow('Failed to decrypt')
-    const plaintext = await decrypt(data, dek, canaryAAD(userId, keyId))
-    expect(plaintext.startsWith('thunderbolt-canary-v2:')).toBe(true)
-  })
-})
-
-describe('verifyCanary', () => {
-  it('returns valid with the canarySecret when using the correct DEK + context', async () => {
-    const dek = await generateDEK()
-    const canary = await createCanary(dek, userId, keyId)
-    const result = await verifyCanary(dek, userId, keyId, canary.canaryIv, canary.canaryCtext)
-    expect(result.valid).toBe(true)
-    expect(result.canarySecret).toBe(canary.canarySecret)
+  it('round-trips: the served blob unwraps to the same seed the mint returned', async () => {
+    const ak = await generateAK()
+    const { canaryIv, canaryCtext, canaryKey } = await mintCanary(ak, userId)
+    const reopened = await unwrapCanaryKey(ak, userId, canaryIv, canaryCtext)
+    // Same seed ⇔ same derived signing keypair (the handle itself is opaque).
+    expect((await deriveSigningKeyPair(reopened)).publicKeySpki).toBe(
+      (await deriveSigningKeyPair(canaryKey)).publicKeySpki,
+    )
   })
 
-  it('returns invalid with the wrong DEK', async () => {
-    const canary = await createCanary(await generateDEK(), userId, keyId)
-    const result = await verifyCanary(await generateDEK(), userId, keyId, canary.canaryIv, canary.canaryCtext)
-    expect(result.valid).toBe(false)
-    expect(result.canarySecret).toBeUndefined()
+  it('does NOT open under a different AK — the revoked-device / old-epoch case', async () => {
+    const currentAK = await generateAK()
+    const { canaryIv, canaryCtext } = await mintCanary(currentAK, userId)
+    const retainedOldAK = await generateAK()
+    await expect(unwrapCanaryKey(retainedOldAK, userId, canaryIv, canaryCtext)).rejects.toThrow(
+      'Failed to unwrap canary',
+    )
   })
 
-  it('returns invalid when the AAD context (userId/keyId) does not match', async () => {
-    const dek = await generateDEK()
-    const canary = await createCanary(dek, userId, keyId)
-    expect((await verifyCanary(dek, 'other-user', keyId, canary.canaryIv, canary.canaryCtext)).valid).toBe(false)
-    expect((await verifyCanary(dek, userId, '1', canary.canaryIv, canary.canaryCtext)).valid).toBe(false)
+  it('does NOT open under another account (userId is bound in the AAD)', async () => {
+    const ak = await generateAK()
+    const { canaryIv, canaryCtext } = await mintCanary(ak, userId)
+    await expect(unwrapCanaryKey(ak, 'other-user', canaryIv, canaryCtext)).rejects.toThrow('Failed to unwrap canary')
+  })
+
+  it('rejects garbage blobs loudly', async () => {
+    const ak = await generateAK()
+    await expect(unwrapCanaryKey(ak, userId, 'AAAA', 'AAAA')).rejects.toThrow('Failed to unwrap canary')
   })
 })
 
@@ -93,22 +96,21 @@ describe('recoverCanarySecretV1 (D1 upgrade possession proof)', () => {
 })
 
 describe('deriveSigningKeyPair', () => {
-  it('is deterministic: same canarySecret yields the identical keypair', async () => {
-    const { canarySecret } = await createCanary(await generateDEK(), userId, keyId)
-    const kp1 = await deriveSigningKeyPair(canarySecret)
-    const kp2 = await deriveSigningKeyPair(canarySecret)
+  it('is deterministic: the same seed yields the identical keypair', async () => {
+    const kp1 = await deriveSigningKeyPair(await canaryKeyFromSeed('seed-a'))
+    const kp2 = await deriveSigningKeyPair(await canaryKeyFromSeed('seed-a'))
     expect(kp1.privateKey).toEqual(kp2.privateKey)
     expect(kp1.publicKeySpki).toBe(kp2.publicKeySpki)
   })
 
-  it('different secrets yield different keypairs', async () => {
-    const kp1 = await deriveSigningKeyPair('a'.repeat(64))
-    const kp2 = await deriveSigningKeyPair('b'.repeat(64))
+  it('different seeds yield different keypairs', async () => {
+    const kp1 = await deriveSigningKeyPair(await canaryKeyFromSeed('seed-a'))
+    const kp2 = await deriveSigningKeyPair(await canaryKeyFromSeed('seed-b'))
     expect(kp1.publicKeySpki).not.toBe(kp2.publicKeySpki)
   })
 
   it('exports a WebCrypto-importable base64 SPKI public key', async () => {
-    const { publicKeySpki } = await deriveSigningKeyPair('c'.repeat(64))
+    const { publicKeySpki } = await deriveSigningKeyPair(await canaryKeyFromSeed('seed-c'))
     const imported = await crypto.subtle.importKey(
       'spki',
       base64ToUint8Array(publicKeySpki),
@@ -125,10 +127,10 @@ describe('signChallenge', () => {
     crypto.subtle.importKey('spki', base64ToUint8Array(spki), ecdsaKeyAlgorithm, false, ['verify'])
 
   it("verifies through WebCrypto's exact backend verify path", async () => {
-    const canarySecret = 'd'.repeat(64)
-    const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+    const canaryKey = await canaryKeyFromSeed('seed-d')
+    const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
-    const signature = base64ToUint8Array(await signChallenge(canarySecret, 'nonce-123', 'revoke', 'device-abc'))
+    const signature = base64ToUint8Array(await signChallenge(canaryKey, 'nonce-123', 'revoke', 'device-abc'))
     expect(signature.length).toBe(64) // IEEE P1363 raw r||s
 
     const valid = await crypto.subtle.verify(
@@ -141,10 +143,10 @@ describe('signChallenge', () => {
   })
 
   it('fails verification for a tampered payload', async () => {
-    const canarySecret = 'e'.repeat(64)
-    const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+    const canaryKey = await canaryKeyFromSeed('seed-e')
+    const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
     const publicKey = await importPublicKey(publicKeySpki)
-    const signature = base64ToUint8Array(await signChallenge(canarySecret, 'nonce-123', 'revoke', 'device-abc'))
+    const signature = base64ToUint8Array(await signChallenge(canaryKey, 'nonce-123', 'revoke', 'device-abc'))
 
     for (const payload of [
       encodeChallengePayload('nonce-456', 'revoke', 'device-abc'),
@@ -164,15 +166,15 @@ describe('signRecoveryAttestation / verifyRecoveryAttestation (THU-865)', () => 
     recoveryMlkemPublicKey: 'recovery-mlkem-base64',
   }
 
-  it('round-trips: an anchor signed with a canary secret verifies under that secret', async () => {
-    const canarySecret = 'a'.repeat(64)
-    const attestation = await signRecoveryAttestation(canarySecret, anchor)
-    expect(await verifyRecoveryAttestation(canarySecret, attestation, anchor)).toBe(true)
+  it('round-trips: an anchor signed with a canary key verifies under that key', async () => {
+    const canaryKey = await canaryKeyFromSeed('seed-a')
+    const attestation = await signRecoveryAttestation(canaryKey, anchor)
+    expect(await verifyRecoveryAttestation(canaryKey, attestation, anchor)).toBe(true)
   })
 
   it('rejects a tampered anchor field — this is the substitution attack', async () => {
-    const canarySecret = 'b'.repeat(64)
-    const attestation = await signRecoveryAttestation(canarySecret, anchor)
+    const canaryKey = await canaryKeyFromSeed('seed-b')
+    const attestation = await signRecoveryAttestation(canaryKey, anchor)
 
     // Every field is load-bearing: swapping the ECDH or ML-KEM public key is the
     // recovery-slot hijack itself, and swapping the salt re-derives a different
@@ -183,45 +185,26 @@ describe('signRecoveryAttestation / verifyRecoveryAttestation (THU-865)', () => 
       { ...anchor, kdfSalt: 'attacker-salt' },
       { ...anchor, userId: 'other-user' },
     ]) {
-      expect(await verifyRecoveryAttestation(canarySecret, attestation, tampered)).toBe(false)
+      expect(await verifyRecoveryAttestation(canaryKey, attestation, tampered)).toBe(false)
     }
   })
 
   it('rejects an attestation from a different epoch — the signing key rotates with the AK', async () => {
-    const attestation = await signRecoveryAttestation('c'.repeat(64), anchor)
-    expect(await verifyRecoveryAttestation('d'.repeat(64), attestation, anchor)).toBe(false)
+    const attestation = await signRecoveryAttestation(await canaryKeyFromSeed('seed-c'), anchor)
+    expect(await verifyRecoveryAttestation(await canaryKeyFromSeed('seed-d'), attestation, anchor)).toBe(false)
   })
 
   it('rejects malformed signature bytes rather than throwing', async () => {
-    expect(await verifyRecoveryAttestation('e'.repeat(64), 'not-base64-!!', anchor)).toBe(false)
-    expect(await verifyRecoveryAttestation('e'.repeat(64), '', anchor)).toBe(false)
+    const canaryKey = await canaryKeyFromSeed('seed-e')
+    expect(await verifyRecoveryAttestation(canaryKey, 'not-base64-!!', anchor)).toBe(false)
+    expect(await verifyRecoveryAttestation(canaryKey, '', anchor)).toBe(false)
   })
 
   it('does not accept a challenge signature as an attestation (domain separation)', async () => {
     // The nonce is SERVER-chosen, so without the domain tag a malicious server
     // could try to steer a harvested challenge signature into the anchor check.
-    const canarySecret = 'f'.repeat(64)
-    const challengeSignature = await signChallenge(canarySecret, 'nonce-123', 'rotate', 'device-abc')
-    expect(await verifyRecoveryAttestation(canarySecret, challengeSignature, anchor)).toBe(false)
-  })
-
-  it('does not accept an attestation as a challenge proof (domain separation, reverse)', async () => {
-    const canarySecret = 'f'.repeat(64)
-    const attestation = await signRecoveryAttestation(canarySecret, anchor)
-    const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
-    const publicKey = await crypto.subtle.importKey(
-      'spki',
-      base64ToUint8Array(publicKeySpki),
-      ecdsaKeyAlgorithm,
-      false,
-      ['verify'],
-    )
-    const valid = await crypto.subtle.verify(
-      ecdsaSignAlgorithm,
-      publicKey,
-      base64ToUint8Array(attestation),
-      encodeChallengePayload('nonce-123', 'rotate', 'device-abc') as BufferSource,
-    )
-    expect(valid).toBe(false)
+    const canaryKey = await canaryKeyFromSeed('seed-f')
+    const challengeSignature = await signChallenge(canaryKey, 'nonce-123', 'rotate', 'device-abc')
+    expect(await verifyRecoveryAttestation(canaryKey, challengeSignature, anchor)).toBe(false)
   })
 })

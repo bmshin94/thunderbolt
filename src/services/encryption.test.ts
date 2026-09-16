@@ -23,7 +23,7 @@ import {
   encodeRecoverySeed,
   decodeRecoveryKey,
   generateKdfSalt,
-  createCanary,
+  mintCanary,
   encrypt,
   decrypt,
   exportPublicKey,
@@ -492,15 +492,15 @@ const seedV2Account = async (
   extraDekIds: KeyId[] = [],
 ): Promise<void> => {
   const ak = await generateAK(true)
-  const { dek: dek0, wrappedKey: w0 } = await mintDEK(ak, '0')
+  const { wrappedKey: w0 } = await mintDEK(ak, '0')
   server.wrappedKeys.set('0', w0)
   server.wrappedKeys.set('v1', await wrapDEK(legacyCK, ak, 'v1'))
   for (const id of extraDekIds) {
     const { wrappedKey } = await mintDEK(ak, id)
     server.wrappedKeys.set(id, wrappedKey)
   }
-  const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek0, testUserId, '0')
-  const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+  const { canaryIv, canaryCtext, canaryKey } = await mintCanary(ak, testUserId)
+  const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
   server.envelopes.set('test-device-id', await wrapAK(ak, kp.ecdhPublicKey, kp.mlkemPublicKey))
   server.deviceTrusted.set('test-device-id', true)
   server.devicePublicKeys.set('test-device-id', {
@@ -520,7 +520,7 @@ const seedV2Account = async (
     recoveryEcdhPublicKey,
     recoveryMlkemPublicKey,
     recoveryWrappedAk: await wrapAK(ak, fixtureRecoveryKeyPair.ecdhPublicKey, fixtureRecoveryKeyPair.mlkemPublicKey),
-    recoveryAttestation: await signRecoveryAttestation(canarySecret, {
+    recoveryAttestation: await signRecoveryAttestation(canaryKey, {
       userId: testUserId,
       kdfSalt: fixtureRecoverySalt,
       recoveryEcdhPublicKey,

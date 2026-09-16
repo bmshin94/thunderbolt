@@ -2,7 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-import { AKAnchorError, LockoutIncompleteError, RecoveryAnchorError } from '@/services/encryption'
+import {
+  AKAnchorError,
+  LockoutIncompleteError,
+  RecoveryAnchorError,
+  StaleKeyMaterialError,
+} from '@/services/encryption'
 
 /**
  * How the user clears the failure. Rendered as an action beside the message
@@ -10,7 +15,7 @@ import { AKAnchorError, LockoutIncompleteError, RecoveryAnchorError } from '@/se
  * navigations away (Settings → Preferences → Data), so a sentence that merely
  * says it is a dangling instruction.
  */
-export type RevokeFailureAction = 'retry' | 'phraseChange' | 'finishLockout'
+export type RevokeFailureAction = 'retry' | 'phraseChange' | 'finishLockout' | 'refreshKeys'
 
 export type RevokeFailure = {
   message: string
@@ -64,6 +69,17 @@ const tamperingNote = ' This can indicate tampering.'
  * this returns.
  */
 export const describeRevokeFailure = (err: unknown): RevokeFailure => {
+  // Pre-cut and deliberate (THU-872): the canary opens only under the CURRENT
+  // account key, and the revoke path never refreshes silently — an emergency
+  // cut must not have a server-driven key adoption running invisibly inside it.
+  // Nothing was applied; the fix is an explicit refresh, then retry.
+  if (err instanceof StaleKeyMaterialError) {
+    return {
+      message: "Nothing was changed — this device's encryption keys are out of date.",
+      action: 'refreshKeys',
+    }
+  }
+
   const cause = wedgeCause(err instanceof LockoutIncompleteError ? err.cause : err)
 
   if (err instanceof LockoutIncompleteError) {

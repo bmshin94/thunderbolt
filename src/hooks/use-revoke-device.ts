@@ -4,7 +4,7 @@
 
 import { useHttpClient } from '@/contexts'
 import { isE2eeReady } from '@/hooks/use-e2ee-ready'
-import { revokeDeviceAndRotate, revokeDeviceWithProof } from '@/services/encryption'
+import { refreshAK, revokeDeviceAndRotate, revokeDeviceWithProof } from '@/services/encryption'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 type UseRevokeDeviceDeps = {
@@ -26,6 +26,21 @@ type UseRevokeDeviceDeps = {
  * that fails after the cut leaves the removed device holding a usable account
  * key, and this mutation rejecting is the only synchronous signal of that.
  */
+/**
+ * Mutation for the revoke dialog's explicit "refresh keys" step (THU-872).
+ *
+ * A revocation deliberately never refreshes this device's account key as a
+ * silent side effect — the canary that signs the revoke proof opens only under
+ * the CURRENT key, so a device that fell behind a rotation gets
+ * `StaleKeyMaterialError` instead, and this mutation is the user-visible
+ * remedy: adopt the replaced envelope (witness-gated, `refreshAK`), after which
+ * the caller retries the revoke.
+ */
+export const useRefreshKeys = () => {
+  const httpClient = useHttpClient()
+  return useMutation({ mutationFn: () => refreshAK(httpClient) })
+}
+
 export const useRevokeDevice = (deps: UseRevokeDeviceDeps = {}) => {
   const httpClient = useHttpClient()
   const queryClient = useQueryClient()

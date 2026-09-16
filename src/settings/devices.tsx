@@ -18,7 +18,7 @@ import { useQuery } from '@powersync/tanstack-react-query'
 import { toCompilableQuery } from '@powersync/drizzle-driver'
 import { useApproveDevice } from '@/hooks/use-approve-device'
 import { useDenyDevice } from '@/hooks/use-deny-device'
-import { useRevokeDevice } from '@/hooks/use-revoke-device'
+import { useRefreshKeys, useRevokeDevice } from '@/hooks/use-revoke-device'
 import { useFinishLockout, useLockoutPending } from '@/hooks/use-lockout-pending'
 import { describeRevokeFailure } from '@/services/revoke-failure'
 import { useRemoveDevice } from '@/hooks/use-remove-device'
@@ -301,6 +301,7 @@ export default function DevicesSettingsPage() {
   })
 
   const revokeMutation = useRevokeDevice()
+  const refreshKeysMutation = useRefreshKeys()
   const removeMutation = useRemoveDevice()
   const denyMutation = useDenyDevice()
   const approveMutation = useApproveDevice(pendingDevices)
@@ -436,7 +437,35 @@ export default function DevicesSettingsPage() {
         variant="trusted"
         error={revokeFailure?.message}
         errorAction={
-          revokeFailure?.action === 'phraseChange' ? (
+          revokeFailure?.action === 'refreshKeys' ? (
+            // The revoke NEVER refreshes keys as a silent side effect (THU-872)
+            // — adopting a server-supplied account key inside an emergency cut
+            // is exactly the dependency THU-887 removed. One explicit action:
+            // refresh (witness-gated), then retry the same revoke.
+            <div className="flex flex-col gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                isLoading={refreshKeysMutation.isPending}
+                loadingLabel="Refreshing keys…"
+                onClick={() =>
+                  refreshKeysMutation.mutate(undefined, {
+                    onSuccess: () => confirmPendingAction('revoke', revokeMutation),
+                  })
+                }
+              >
+                Refresh keys and retry
+              </Button>
+              {refreshKeysMutation.error && (
+                <p className="text-[length:var(--font-size-xs)] text-destructive" role="alert">
+                  {refreshKeysMutation.error.message}
+                </p>
+              )}
+              <p className="text-[length:var(--font-size-xs)] text-muted-foreground">
+                Another device changed the account keys. Refreshing fetches the current key, then the revoke runs again.
+              </p>
+            </div>
+          ) : revokeFailure?.action === 'phraseChange' ? (
             // A link, not a sentence: the section lives in Settings →
             // Preferences → Data, so naming it in prose leaves the user to find
             // it. The cost is stated because it is irreversible — the phrase

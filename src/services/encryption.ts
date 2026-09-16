@@ -25,13 +25,14 @@ import {
   mintDEK,
   rewrapKeyring,
   unwrapLegacyCK,
-  createCanary,
-  verifyCanary,
+  mintCanary,
+  unwrapCanaryKey,
   recoverCanarySecretV1,
   deriveSigningKeyPair,
   signChallenge,
   signRecoveryAttestation,
   verifyRecoveryAttestation,
+  DecryptionError,
   decrypt,
   encrypt,
   generateRecoverySeed,
@@ -127,6 +128,21 @@ export class RotationStaleError extends Error {
   constructor(options?: ErrorOptions) {
     super('Key rotation state was stale — state refreshed, retry the rotation', options)
     this.name = 'RotationStaleError'
+  }
+}
+
+/**
+ * Thrown when this device's key material is too stale to derive the current
+ * signing key (the served canary does not open under the local AK) on a path
+ * that DELIBERATELY does not refresh — device revocation (THU-872). Refreshing
+ * adopts server-supplied key material, and an emergency cut must not depend on
+ * a fallible, attacker-influenced adoption running silently inside it: the UI
+ * surfaces an explicit "refresh keys, then retry" step instead.
+ */
+export class StaleKeyMaterialError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("This device's encryption keys are out of date — refresh keys and retry", options)
+    this.name = 'StaleKeyMaterialError'
   }
 }
 
@@ -258,26 +274,17 @@ const getOrCreateKeyPair = async (): Promise<StoredKeyPair> => {
   }
 }
 
-/** Resolve the wrapped DEK '0' blob — local staged copy first, then the server. */
-const getWrappedDek0 = async (httpClient: HttpClient): Promise<string> => {
-  const local = await getDEK(initialKeyId)
-  if (local) {
-    return local
-  }
-  const { wrapped_key: wrappedKey } = await fetchWrappedKey(httpClient, initialKeyId)
-  return wrappedKey
-}
-
 /**
- * Recover the canary secret from local key material: AK → wrapped DEK '0' →
- * unwrap → decrypt the canary bound to `canaryAAD(userId, '0')`. The canary is
- * permanently anchored to DEK '0' (every server write path — bootstrap, rotate,
- * upgrade — encrypts it under key_id '0'), so verification always uses '0' even
- * after a DEK rotation moves the primary elsewhere. The secret seeds the
- * deterministic ECDSA signing keypair used for challenge proofs; it never leaves
- * the client.
+ * Recover the canary key from local key material: AK → unwrap the served canary
+ * (THU-872 — the canary is anchored to the ACCOUNT KEY, so only a device holding
+ * the current AK can open it; a revoked device's retained DEK "0" derives
+ * nothing). The seed never surfaces to script; the returned handle feeds the
+ * deterministic ECDSA signing keypair used for challenge proofs.
+ *
+ * Throws `DecryptionError` when the canary does not open under the local AK —
+ * the signature of a stale AK after a rotation elsewhere.
  */
-const getCanarySecret = async (httpClient: HttpClient): Promise<string> => {
+const readCanaryKey = async (httpClient: HttpClient): Promise<CryptoKey> => {
   const metadata = await fetchEncryptionMetadata(httpClient)
   if (!metadata.canary_iv || !metadata.canary_ctext) {
     throw new Error('Canary is not set up on the server')
@@ -286,35 +293,47 @@ const getCanarySecret = async (httpClient: HttpClient): Promise<string> => {
   if (!ak) {
     throw new Error('Account key not found in IndexedDB')
   }
-  const dek0 = await unwrapDEK(await getWrappedDek0(httpClient), ak, initialKeyId)
-  const { valid, canarySecret } = await verifyCanary(
-    dek0,
-    getUserId(),
-    initialKeyId,
-    metadata.canary_iv,
-    metadata.canary_ctext,
-  )
-  if (!valid || !canarySecret) {
-    throw new Error('Failed to verify canary — key material may be corrupted')
+  return unwrapCanaryKey(ak, getUserId(), metadata.canary_iv, metadata.canary_ctext)
+}
+
+/**
+ * `readCanaryKey` with the stale-AK self-heal: on a canary that does not open,
+ * refresh this device's AK (witness-gated, `refreshAK`) and retry ONCE.
+ * `refresh: false` is the device-revocation variant (THU-872): the emergency
+ * cut must not have a server-driven key adoption running silently inside it,
+ * so it surfaces `StaleKeyMaterialError` for an EXPLICIT refresh-then-retry
+ * step instead.
+ */
+const getCanaryKey = async (httpClient: HttpClient, opts: { refresh?: boolean } = {}): Promise<CryptoKey> => {
+  try {
+    return await readCanaryKey(httpClient)
+  } catch (err) {
+    if (!(err instanceof DecryptionError)) {
+      throw err
+    }
+    if (opts.refresh === false) {
+      throw new StaleKeyMaterialError({ cause: err })
+    }
+    await refreshAK(httpClient)
+    return readCanaryKey(httpClient)
   }
-  return canarySecret
 }
 
 /**
  * Build a ChallengeProof for a trust-sensitive operation: fetch a single-use
  * nonce and sign `nonce ‖ operation ‖ deviceId` with the signing key derived
- * from the canary secret. Pass `canarySecret` when it is already in hand
- * (recovery); otherwise it is extracted from local key material.
+ * from the canary key. Pass `canaryKey` when it is already in hand (recovery);
+ * otherwise it is recovered from local key material.
  */
 const buildProof = async (
   httpClient: HttpClient,
   operation: ChallengeOperation,
-  canarySecret?: string,
+  canaryKey?: CryptoKey,
 ): Promise<ChallengeProof> => {
-  const secret = canarySecret ?? (await getCanarySecret(httpClient))
+  const key = canaryKey ?? (await getCanaryKey(httpClient))
   const { nonce } = await fetchChallenge(httpClient, operation)
   const deviceId = getDeviceId()
-  const signature = await signChallenge(secret, nonce, operation, deviceId)
+  const signature = await signChallenge(key, nonce, operation, deviceId)
   return { signature, nonce, operation, deviceId }
 }
 
@@ -357,7 +376,7 @@ type RecoveryPublicKeys = { ecdhPublicKey: CryptoKey; mlkemPublicKey: Uint8Array
  * public halves, which is what lets any trusted device rotate the AK without
  * ever seeing the phrase.
  *
- * `canarySecret` must be the one belonging to the SAME write — the newly minted
+ * `canaryKey` must be the one belonging to the SAME write — the newly minted
  * canary on a rotation/upgrade, or the just-created one at first-device setup.
  * Signing the anchor with it (THU-865) is what lets the next rotating device
  * verify these public keys instead of trusting whatever the server serves.
@@ -366,7 +385,7 @@ const buildRecoverySlot = async (
   ak: CryptoKey,
   recovery: RecoveryPublicKeys,
   kdfSalt: string,
-  canarySecret: string,
+  canaryKey: CryptoKey,
 ): Promise<RecoverySlotRequest> => {
   const recoveryEcdhPublicKey = await exportPublicKey(recovery.ecdhPublicKey)
   const recoveryMlkemPublicKey = exportMlKemPublicKey(recovery.mlkemPublicKey)
@@ -374,7 +393,7 @@ const buildRecoverySlot = async (
     recoveryEcdhPublicKey,
     recoveryMlkemPublicKey,
     recoveryWrappedAK: await wrapAK(ak, recovery.ecdhPublicKey, recovery.mlkemPublicKey),
-    recoveryAttestation: await signRecoveryAttestation(canarySecret, {
+    recoveryAttestation: await signRecoveryAttestation(canaryKey, {
       userId: getUserId(),
       kdfSalt,
       recoveryEcdhPublicKey,
@@ -411,11 +430,11 @@ const mintRecoveryPlan = async (): Promise<Extract<RecoveryPlan, { mode: 'new' }
  * public keys, so a malicious server that substitutes its own here would receive
  * the AK and could then recover the account with a phrase it chose — silently,
  * on any routine device revoke. The attestation closes that: it is verified
- * against a signing key derived from `canarySecret`, which the caller recovered
- * from its OWN key material (`getCanarySecret`), so only a keyring holder could
+ * against a signing key derived from `canaryKey`, which the caller recovered
+ * from its OWN key material (`getCanaryKey`), so only a keyring holder could
  * have produced it. Fail closed — never adopt an unverifiable anchor.
  */
-const readStoredRecoveryPlan = async (httpClient: HttpClient, canarySecret: string): Promise<RecoveryPlan> => {
+const readStoredRecoveryPlan = async (httpClient: HttpClient, canaryKey: CryptoKey): Promise<RecoveryPlan> => {
   const metadata = await fetchEncryptionMetadata(httpClient)
   if (!metadata.kdf_salt || !metadata.recovery_ecdh_public_key || !metadata.recovery_mlkem_public_key) {
     throw new Error(
@@ -430,7 +449,7 @@ const readStoredRecoveryPlan = async (httpClient: HttpClient, canarySecret: stri
   }
   if (
     !metadata.recovery_attestation ||
-    !(await verifyRecoveryAttestation(canarySecret, metadata.recovery_attestation, anchor))
+    !(await verifyRecoveryAttestation(canaryKey, metadata.recovery_attestation, anchor))
   ) {
     throw new RecoveryAnchorError()
   }
@@ -530,11 +549,11 @@ const fetchKeyring = async (httpClient: HttpClient): Promise<FetchedKeyring> => 
 /**
  * DEK `"0"`'s wrapped blob as the SERVER just served it.
  *
- * Never use `getWrappedDek0` for this: it prefers the LOCAL blob, which after a
- * rotation is still wrapped under the OLD AK, so unwrapping it under a candidate
- * new AK fails and every legitimate rotation would be refused. The check reads
- * the served row; the mint reads the local one. Opposite directions, same
- * key_id — keep them apart.
+ * Never resolve this from the LOCAL staged blob: after a rotation that copy is
+ * still wrapped under the OLD AK, so unwrapping it under a candidate new AK
+ * fails and every legitimate rotation would be refused. The check reads the
+ * served row; the mint reads the local one. Opposite directions, same key_id —
+ * keep them apart.
  */
 const servedWrappedDek0 = (keyring: FetchedKeyring): string | null =>
   keyring.keys.find((key) => key.key_id === initialKeyId)?.wrapped_key ?? null
@@ -841,12 +860,15 @@ export const completeFirstDeviceSetup = async (httpClient: HttpClient): Promise<
   // Extractable only transiently — it must be wrapped into the two envelopes.
   const extractableAK = await generateAK(true)
 
-  const { dek, wrappedKey } = await mintDEK(extractableAK, initialKeyId)
-  const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek, getUserId(), initialKeyId)
-  const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+  const { wrappedKey } = await mintDEK(extractableAK, initialKeyId)
+  // Anchored to the AK, not DEK "0" (THU-872) — `canaryKey` is the unwrap of the
+  // exact bytes being posted, so the published signing key is correct by
+  // construction (the pre-submit round-trip check).
+  const { canaryIv, canaryCtext, canaryKey } = await mintCanary(extractableAK, getUserId())
+  const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
   const wrappedCK = await wrapAK(extractableAK, keyPair.ecdhPublicKey, keyPair.mlkemPublicKey)
-  const recoverySlot = await buildRecoverySlot(extractableAK, recovery.publicKeys, recovery.kdfSalt, canarySecret)
+  const recoverySlot = await buildRecoverySlot(extractableAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
   const ak = await reimportAsNonExtractable(extractableAK)
 
   await storeEnvelope(httpClient, {
@@ -945,7 +967,7 @@ export const setDeviceNodeIdWithProof = async (
  * metadata (404) or a v1 leftover (NULL signing_public_key) → no proof needed
  * (the backend skips verification for those accounts).
  */
-const buildRevokeProof = async (httpClient: HttpClient, canarySecret?: string): Promise<ChallengeProof | undefined> => {
+const buildRevokeProof = async (httpClient: HttpClient, canaryKey?: CryptoKey): Promise<ChallengeProof | undefined> => {
   const metadata = await fetchEncryptionMetadata(httpClient).catch((err: unknown) => {
     if (err instanceof HttpError && err.response.status === 404) {
       return null
@@ -955,7 +977,7 @@ const buildRevokeProof = async (httpClient: HttpClient, canarySecret?: string): 
   if (!metadata || metadata.signing_public_key == null) {
     return undefined
   }
-  return buildProof(httpClient, 'revoke', canarySecret)
+  return buildProof(httpClient, 'revoke', canaryKey)
 }
 
 /**
@@ -964,16 +986,16 @@ const buildRevokeProof = async (httpClient: HttpClient, canarySecret?: string): 
  * cuts server access — `revokeDeviceAndRotate` also locks the device out of
  * the keyring cryptographically.
  *
- * `canarySecret` is an optional pre-recovered secret, passed by
- * `revokeDeviceAndRotate` so the whole revocation extracts it once instead of
+ * `canaryKey` is an optional pre-recovered canary key, passed by
+ * `revokeDeviceAndRotate` so the whole revocation recovers it once instead of
  * once per step.
  */
 export const revokeDeviceWithProof = async (
   httpClient: HttpClient,
   deviceId: string,
-  canarySecret?: string,
+  canaryKey?: CryptoKey,
 ): Promise<void> => {
-  const proof = await buildRevokeProof(httpClient, canarySecret).catch((err: unknown) => {
+  const proof = await buildRevokeProof(httpClient, canaryKey).catch((err: unknown) => {
     trackError(
       createHandleError('CANARY_EXTRACTION_FAILED', 'Failed to build challenge proof during device revocation', err),
     )
@@ -1080,14 +1102,12 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
   if (!dek0) {
     throw new ValidationError('Invalid recovery key')
   }
-  const { valid, canarySecret } = await verifyCanary(
-    dek0,
-    getUserId(),
-    initialKeyId,
-    metadata.canary_iv,
-    metadata.canary_ctext,
-  )
-  if (!valid || !canarySecret) {
+  // The canary is wrapped under the CURRENT AK (THU-872), so a recovery slot
+  // that no longer matches the live epoch fails to open it. DEK '0' is unwrapped
+  // separately, ONLY for the keyring witness below — the two paths share no
+  // variable.
+  const canaryKey = await unwrapCanaryKey(ak, getUserId(), metadata.canary_iv, metadata.canary_ctext).catch(() => null)
+  if (!canaryKey) {
     throw new ValidationError('Invalid recovery key')
   }
 
@@ -1100,7 +1120,7 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
     keyPair.ecdhPublicKey,
     keyPair.mlkemPublicKey,
   )
-  const proof = await buildProof(httpClient, 'approve', canarySecret)
+  const proof = await buildProof(httpClient, 'approve', canaryKey)
   await storeEnvelope(httpClient, { deviceId, wrappedCK, proof })
 
   // DELIBERATELY NOT gated by the DEK "0" witness check: the phrase is the
@@ -1238,11 +1258,11 @@ export type RotateAKOptions = {
 
 /**
  * Resolves the recovery anchor for one rotation. Invoked AFTER the proof is
- * built, and handed the OLD epoch's canary secret so a 'keep' re-anchor can
+ * built, and handed the OLD epoch's canary key so a 'keep' re-anchor can
  * verify the served anchor's attestation against local key material (THU-865).
  * A 'new' anchor mints its own keys and ignores it.
  */
-type ResolveRecoveryPlan = (canarySecret: string) => Promise<RecoveryPlan>
+type ResolveRecoveryPlan = (canaryKey: CryptoKey) => Promise<RecoveryPlan>
 
 /**
  * The one AK rotation (0 rows re-encrypted): generate a random new AK, re-wrap
@@ -1264,18 +1284,18 @@ const runAKRotation = async (
   // Recovered once and used twice: the 'rotate' proof and the recovery-anchor
   // verification both need the OLD epoch's signing key. Deriving it from local
   // key material is what makes the anchor check server-independent.
-  const oldCanarySecret = await getCanarySecret(httpClient)
+  const oldCanaryKey = await getCanaryKey(httpClient)
 
   // Proof FIRST — it must be signed with the OLD signing key, which the server
   // still holds until the rotate transaction commits.
-  const proof = await buildProof(httpClient, 'rotate', oldCanarySecret)
+  const proof = await buildProof(httpClient, 'rotate', oldCanaryKey)
 
   const oldAK = await getAK()
   if (!oldAK) {
     throw new Error('Account key not found in IndexedDB')
   }
 
-  const recovery = await resolveRecovery(oldCanarySecret)
+  const recovery = await resolveRecovery(oldCanaryKey)
   // Random and machine-only — wrapping it to the recovery public keys needs no
   // private key, which is what makes a phrase-preserving rotation possible.
   const newAK = await generateAK(true)
@@ -1320,8 +1340,6 @@ const runAKRotation = async (
       `[e2ee] keyring rows could not be re-wrapped and were passed through unchanged: ${strandedKeyIds.join(', ')}`,
     )
   }
-  const dek0 = await unwrapDEK(dek0Wrapped, newAK, initialKeyId)
-
   // The DEK rotation half, when this rotation is also one (revocation). Minted
   // under the NEW AK, so it needs no re-wrap and can never be stranded under a
   // stale AK, and it rides the rotate transaction so a failure adds no keyring
@@ -1344,10 +1362,10 @@ const runAKRotation = async (
   // Minted BEFORE the recovery slot: the slot's attestation must be signed with
   // the NEW canary secret, since that is the key the next rotation will derive
   // to verify it (THU-865).
-  const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek0, getUserId(), initialKeyId)
-  const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+  const { canaryIv, canaryCtext, canaryKey } = await mintCanary(newAK, getUserId())
+  const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
-  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canarySecret)
+  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
 
   // Built OUTSIDE the try below: a malformed escrow pin is a build
   // misconfiguration and must surface as-is, not masquerade as a stale-rotation 4xx.
@@ -1427,7 +1445,7 @@ const runAKRotation = async (
  * throws a retryable `RotationStaleError` when the server rejects a stale payload.
  */
 export const rotateAccountKey = (httpClient: HttpClient, opts: RotateAKOptions = {}): Promise<void> =>
-  runAKRotation(httpClient, (canarySecret) => readStoredRecoveryPlan(httpClient, canarySecret), opts)
+  runAKRotation(httpClient, (canaryKey) => readStoredRecoveryPlan(httpClient, canaryKey), opts)
 
 /**
  * Explicit recovery-phrase change: rotates the AK AND re-anchors the recovery
@@ -1490,9 +1508,14 @@ export const revokeDeviceAndRotate = async (
   deviceId: string,
   opts: Pick<RotateAKOptions, 'listTrustedDevices'> = {},
 ): Promise<void> => {
-  // Extracted ONCE for the whole revocation: the pre-flight below and the
-  // revoke proof both need it, and each used to recover it separately.
-  const canarySecret = await getCanarySecret(httpClient)
+  // Recovered ONCE for the whole revocation: the pre-flight below and the
+  // revoke proof both need it. `refresh: false` is deliberate (THU-872): the
+  // canary now opens only under the CURRENT AK, so a stale device cannot build
+  // this proof from local material — but silently adopting a server-supplied
+  // AK inside the emergency cut is exactly the dependency THU-887 removed.
+  // Surface `StaleKeyMaterialError` instead; the UI offers an explicit
+  // "refresh keys, then retry" step.
+  const canaryKey = await getCanaryKey(httpClient, { refresh: false })
 
   // PRE-FLIGHT, DELIBERATELY DISCARDED. This is the check that fails closed on
   // a served recovery anchor that does not verify (THU-865) and on an account
@@ -1504,9 +1527,9 @@ export const revokeDeviceAndRotate = async (
   // itself: a phrase change on another device between here and there would
   // otherwise be silently reverted by this stale-but-verified copy. One extra
   // metadata fetch is the price of that, and it buys the narrower window.
-  await readStoredRecoveryPlan(httpClient, canarySecret)
+  await readStoredRecoveryPlan(httpClient, canaryKey)
 
-  await revokeDeviceWithProof(httpClient, deviceId, canarySecret)
+  await revokeDeviceWithProof(httpClient, deviceId, canaryKey)
 
   // Past the cut. Everything from here is the rotation, and a failure means the
   // device is revoked but not locked out — tagged rather than propagated raw so
@@ -1699,11 +1722,13 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
   const recovery = await mintRecoveryPlan()
   const newAK = await generateAK(true)
 
-  const { dek: dek0, wrappedKey: wrappedDek0 } = await mintDEK(newAK, initialKeyId)
+  const { wrappedKey: wrappedDek0 } = await mintDEK(newAK, initialKeyId)
   const wrappedV1 = await wrapDEK(legacyCK, newAK, legacyKeyId)
 
-  const { canaryIv, canaryCtext, canarySecret } = await createCanary(dek0, getUserId(), initialKeyId)
-  const { publicKeySpki } = await deriveSigningKeyPair(canarySecret)
+  // Anchored to the new AK (THU-872); the v1 possession proof below still uses
+  // the LEGACY canary the server currently stores — two different artifacts.
+  const { canaryIv, canaryCtext, canaryKey } = await mintCanary(newAK, getUserId())
+  const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
   // Always cover THIS device from local key material — never rely solely on the
   // synced `devices` table, which may not have replicated this (freshly trusted)
@@ -1719,7 +1744,7 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
     ? trustedDevices
     : [self, ...trustedDevices]
   const envelopes = await buildDeviceEnvelopes(newAK, devicesToCover)
-  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canarySecret)
+  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
 
   const { nonce } = await fetchChallenge(httpClient, 'upgrade')
 

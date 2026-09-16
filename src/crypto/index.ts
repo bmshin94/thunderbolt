@@ -36,8 +36,8 @@ export {
 
 // Canary + challenge-response signing
 export {
-  createCanary,
-  verifyCanary,
+  mintCanary,
+  unwrapCanaryKey,
   recoverCanarySecretV1,
   deriveSigningKeyPair,
   signChallenge,

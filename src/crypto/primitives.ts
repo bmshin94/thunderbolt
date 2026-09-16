@@ -9,10 +9,10 @@ import { DecryptionError, EncryptionError } from './errors'
 const ecdhAlgorithm = 'ECDH'
 const ecdhCurve = 'P-256'
 const ephemeralPubKeyLength = 65 // P-256 uncompressed: 0x04 || x (32) || y (32)
-const aesGcmAlgorithm = 'AES-GCM'
+export const aesGcmAlgorithm = 'AES-GCM'
 const aesKwAlgorithm = 'AES-KW'
 const aesKeyLength = 256
-const ivLength = 12
+export const ivLength = 12
 const hkdfHash = 'SHA-256'
 
 // Hybrid envelope constants — byte layout is a wire contract, never change.
