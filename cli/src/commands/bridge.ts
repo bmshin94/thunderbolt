@@ -263,6 +263,18 @@ export const resolveBridgeHost = (env: NodeJS.ProcessEnv = process.env): string 
   return configured
 }
 
+/**
+ * Render a host for a URL authority.
+ *
+ * An IPv6 literal has to be bracketed or the result is not a URL at all —
+ * `ws://::1:8839` parses as host `` and port `:1:8839`. The printed URL is
+ * meant to be pasted straight into the app, so an operator who pinned an IPv6
+ * loopback would otherwise be handed something unusable. A name or an IPv4
+ * address has no colon and passes through; an already-bracketed value is left
+ * alone.
+ */
+export const hostForUrl = (host: string): string => (host.includes(':') && !host.startsWith('[') ? `[${host}]` : host)
+
 /** Constant-time token comparison. A length mismatch short-circuits to `false`
  *  (`timingSafeEqual` throws on unequal lengths); the token length is fixed and
  *  non-secret, so the early return leaks nothing exploitable. */
@@ -396,9 +408,10 @@ export const runBridge = async (config: BridgeConfig): Promise<void> => {
   // URL, so pasting it whole into the app authenticates with no client change.
   // A public bind reports the wildcard it was given rather than pretending to
   // know the deployment's external hostname — the operator substitutes it.
-  const url = `ws://${host}:${server.port}/?token=${token}`
+  const authority = `${hostForUrl(host)}:${server.port}`
+  const url = `ws://${authority}/?token=${token}`
   process.stdout.write(
-    `⚡ thunderbolt ${config.protocol} bridge (${config.transport}) listening on ws://${host}:${server.port}\n` +
+    `⚡ thunderbolt ${config.protocol} bridge (${config.transport}) listening on ws://${authority}\n` +
       `   spawning per connection: ${redactArgv(config.command)}\n` +
       `   set this as the agent URL in the app (includes the access token): ${url}\n`,
   )

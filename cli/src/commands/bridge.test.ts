@@ -18,6 +18,7 @@ import {
   bridgeAllowedOrigins,
   forwardFrameToStdin,
   generateBridgeToken,
+  hostForUrl,
   maxActiveProcs,
   minConfiguredTokenLength,
   resolveBridgeHost,
@@ -237,5 +238,24 @@ describe('deployment configuration', () => {
     // compose rather than one masking the other.
     expect(resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0', THUNDERBOLT_BRIDGE_TOKEN: 'short' })).toBe('0.0.0.0')
     expect(() => resolveBridgeToken({ THUNDERBOLT_BRIDGE_TOKEN: 'short' })).toThrow('at least')
+  })
+})
+
+describe('hostForUrl', () => {
+  test('brackets an IPv6 literal so the advertised URL parses', () => {
+    // `ws://::1:8839` is not a URL, and this one is meant to be pasted into the
+    // app verbatim.
+    expect(new URL(`ws://${hostForUrl('::1')}:8839/`).hostname).toBe('[::1]')
+    expect(hostForUrl('::')).toBe('[::]')
+  })
+
+  test('leaves names and IPv4 addresses alone', () => {
+    expect(hostForUrl('127.0.0.1')).toBe('127.0.0.1')
+    expect(hostForUrl('0.0.0.0')).toBe('0.0.0.0')
+    expect(hostForUrl('localhost')).toBe('localhost')
+  })
+
+  test('does not double-bracket a value the operator already bracketed', () => {
+    expect(hostForUrl('[::1]')).toBe('[::1]')
   })
 })
