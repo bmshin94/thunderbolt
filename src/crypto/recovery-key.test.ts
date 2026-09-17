@@ -156,11 +156,12 @@ describe('deriveRecoveryKeyPairFromSeed', () => {
     const seed = generateRecoverySeed()
     const salt = generateKdfSalt()
     const wrapper = await deriveRecoveryKeyPairFromSeed(seed, salt)
-    const envelope = await wrapAK(await generateAK(true), wrapper.ecdhPublicKey, wrapper.mlkemPublicKey)
+    const envelope = await wrapAK(await generateAK(true), wrapper.ecdhPublicKey, wrapper.mlkemPublicKey, '0')
 
     const unwrapper = await deriveRecoveryKeyPairFromSeed(seed, salt)
-    const ak = await unwrapAK(envelope, unwrapper.ecdhPrivateKey, unwrapper.mlkemSecretKey)
+    const { ak, primaryKeyId } = await unwrapAK(envelope, unwrapper.ecdhPrivateKey, unwrapper.mlkemSecretKey)
     expect(ak.algorithm.name).toBe('AES-GCM')
+    expect(primaryKeyId).toBe('0')
 
     const dek = await generateDEK(true)
     expect((await unwrapDEK(await wrapDEK(dek, ak, '0'), ak, '0')).algorithm.name).toBe('AES-GCM')
@@ -169,7 +170,7 @@ describe('deriveRecoveryKeyPairFromSeed', () => {
   it('cannot unwrap an envelope sealed to a different phrase', async () => {
     const salt = generateKdfSalt()
     const wrapper = await deriveRecoveryKeyPairFromSeed(generateRecoverySeed(), salt)
-    const envelope = await wrapAK(await generateAK(true), wrapper.ecdhPublicKey, wrapper.mlkemPublicKey)
+    const envelope = await wrapAK(await generateAK(true), wrapper.ecdhPublicKey, wrapper.mlkemPublicKey, '0')
 
     const other = await deriveRecoveryKeyPairFromSeed(generateRecoverySeed(), salt)
     await expect(unwrapAK(envelope, other.ecdhPrivateKey, other.mlkemSecretKey)).rejects.toThrow(

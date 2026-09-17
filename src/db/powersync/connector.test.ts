@@ -340,18 +340,36 @@ describe('ThunderboltConnector primary-key load (TD3)', () => {
     clearDeviceId()
   })
 
-  it('fetches metadata and stores the primary key_id when an AK exists and none is loaded', async () => {
+  it('never adopts the metadata pointer — defers and nudges an envelope adoption (THU-890)', async () => {
+    // This used to store `metadata.primary_key_id`, which made the connector
+    // the door for a grammar-valid pointer rollback ('0' served after a
+    // rotation moved the primary to '1'). The pointer's only trusted source is
+    // now the AK envelope: the connector defers the batch and posts a
+    // key-request so the main-thread responder re-adopts.
     await storeAK(await generateAK())
     fetchMock.mockImplementation((url: string) =>
       Promise.resolve(url.includes('/encryption/canary') ? okResponse({ primary_key_id: '0' }) : okResponse({})),
     )
     const connector = new ThunderboltConnector(backendUrl, fetchMock as unknown as typeof fetch)
 
-    await connector.uploadData(makeDatabase())
+    // Spy on the channel's post rather than listening: delivery is async and
+    // this suite runs under a controlled clock, so a listener would race.
+    const nudges: unknown[] = []
+    const postSpy = spyOn(BroadcastChannel.prototype, 'postMessage').mockImplementation(function (
+      this: BroadcastChannel,
+      message: unknown,
+    ) {
+      nudges.push(message)
+    })
+    try {
+      await expect(connector.uploadData(makeDatabase())).rejects.toThrow(/deferring upload until the envelope/)
+    } finally {
+      postSpy.mockRestore()
+    }
 
-    expect(await getPrimaryKeyId()).toBe('0')
-    expect(requestedUrls().some((url) => url.includes('/encryption/canary'))).toBe(true)
-    expect(requestedUrls().some((url) => url.includes('/powersync/upload'))).toBe(true)
+    expect(await getPrimaryKeyId()).toBeNull()
+    expect(requestedUrls().some((url) => url.includes('/powersync/upload'))).toBe(false)
+    expect(nudges).toContainEqual({ type: 'key-request', keyId: '0', reason: 'unknown-key' })
   })
 
   it('does not fetch metadata when a primary key_id is already loaded', async () => {
@@ -427,23 +445,21 @@ describe('ThunderboltConnector upload encryption gate', () => {
     expect(wasCompleted()).toBe(false)
   })
 
-  it('defers the upload when the server steers the primary onto the legacy "v1" slot (THU-876)', async () => {
-    // The second place a server-reported pointer becomes durable local state.
-    // Same `/encryption/canary` response `applyKeyring` reads, so one lie steers
-    // both — a fix limited to `applyKeyring` would leave this path open.
+  it('defers the upload whatever pointer the server serves — "v1" steer included (THU-876/THU-890)', async () => {
+    // This used to be the second place a served pointer became durable local
+    // state. Post-THU-890 the connector never reads the metadata pointer at
+    // all: honest, steered ('v1') or rolled back ('0'), the answer is the same
+    // defer until an adopted envelope supplies the pointer.
     await storeAK(await generateAK())
     fetchMock = routeCanary(() => jsonResponse({ primary_key_id: 'v1' }))
     const connector = new ThunderboltConnector(backendUrl, fetchMock as unknown as typeof fetch)
     const { database, wasCompleted } = makeDatabase()
 
-    // Matches the connector's OWN message, not the storage layer's: the drawer
-    // guard in `storePrimaryKeyId` would also refuse this value, so a looser
-    // pattern would pass with this method's guard removed.
-    await expect(connector.uploadData(database)).rejects.toThrow(/deferring upload instead of encrypting under it/)
+    await expect(connector.uploadData(database)).rejects.toThrow(/deferring upload until the envelope/)
 
     expect(uploadAttempted()).toBe(false)
     expect(wasCompleted()).toBe(false)
-    // Nothing durable was written, so a later honest response still lands.
+    // Nothing durable was written, so a later honest adoption still lands.
     expect(await getPrimaryKeyId()).toBeNull()
   })
 

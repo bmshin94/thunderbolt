@@ -174,14 +174,17 @@ describe('encode', () => {
     await expect(codec.encode('x', ctx)).rejects.toThrow('non-mintable primary key_id')
   })
 
-  it("falls back to key_id '0' when no primary pointer is set but DEK 0 exists", async () => {
+  it('fails closed when no primary pointer is set, even if DEK 0 exists (THU-890)', async () => {
+    // The DEK-0 write fallback was REMOVED: the pointer's only trusted source
+    // is an adopted AK envelope, so "no pointer" means "no verified envelope
+    // yet" — silently sealing under "0" was a downgrade primitive. An AK is
+    // present, so encode must fail closed rather than pass plaintext through.
     const ak = await generateAK()
     await storeAK(ak)
     const minted = await mintDEK(ak, '0')
     await storeDEK('0', minted.wrappedKey)
 
-    const encoded = await codec.encode('fallback', ctx)
-    expect(parseWireValue(encoded)?.keyId).toBe('0')
+    await expect(codec.encode('fallback', ctx)).rejects.toThrow('Encryption keys unavailable after E2EE setup')
   })
 
   it('throws when called without an EncryptionContext', async () => {

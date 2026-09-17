@@ -18,6 +18,8 @@ export {
   wrapAK,
   rewrapAK,
   unwrapAK,
+  wrapLegacyCK,
+  type OpenedAkEnvelope,
   wrapDEK,
   unwrapDEK,
   rewrapKeyring,

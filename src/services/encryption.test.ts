@@ -19,6 +19,7 @@ import {
   deriveSigningKeyPair,
   signRecoveryAttestation,
   unwrapAK,
+  wrapLegacyCK,
   generateRecoverySeed,
   encodeRecoverySeed,
   decodeRecoveryKey,
@@ -465,7 +466,13 @@ const fixtureRecoveryKeyPair = await deriveRecoveryKeyPairFromSeed(new Uint8Arra
 
 /** Unwrap this device's staged envelope into the account AK (test convenience). */
 const unwrapDeviceAK = async (server: FakeServer): Promise<CryptoKey> =>
-  unwrapAK(server.envelopes.get('test-device-id')!, storedKeyPair!.ecdhPrivateKey, storedKeyPair!.mlkemSecretKey)
+  (
+    await unwrapAK(
+      server.envelopes.get('test-device-id')!,
+      storedKeyPair!.ecdhPrivateKey,
+      storedKeyPair!.mlkemSecretKey,
+    )
+  ).ak
 
 const generateFullKeyPair = async (): Promise<StoredKeyPair> => {
   const ecdhKeyPair = await generateKeyPair()
@@ -490,7 +497,7 @@ const seedV2Account = async (
   kp: StoredKeyPair,
   legacyCK: CryptoKey,
   extraDekIds: KeyId[] = [],
-): Promise<void> => {
+): Promise<CryptoKey> => {
   const ak = await generateAK(true)
   const { wrappedKey: w0 } = await mintDEK(ak, '0')
   server.wrappedKeys.set('0', w0)
@@ -501,7 +508,7 @@ const seedV2Account = async (
   }
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(ak, testUserId)
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
-  server.envelopes.set('test-device-id', await wrapAK(ak, kp.ecdhPublicKey, kp.mlkemPublicKey))
+  server.envelopes.set('test-device-id', await wrapAK(ak, kp.ecdhPublicKey, kp.mlkemPublicKey, '0'))
   server.deviceTrusted.set('test-device-id', true)
   server.devicePublicKeys.set('test-device-id', {
     publicKey: await exportPublicKey(kp.ecdhPublicKey),
@@ -519,7 +526,12 @@ const seedV2Account = async (
     signingPublicKey: publicKeySpki,
     recoveryEcdhPublicKey,
     recoveryMlkemPublicKey,
-    recoveryWrappedAk: await wrapAK(ak, fixtureRecoveryKeyPair.ecdhPublicKey, fixtureRecoveryKeyPair.mlkemPublicKey),
+    recoveryWrappedAk: await wrapAK(
+      ak,
+      fixtureRecoveryKeyPair.ecdhPublicKey,
+      fixtureRecoveryKeyPair.mlkemPublicKey,
+      '0',
+    ),
     recoveryAttestation: await signRecoveryAttestation(canaryKey, {
       userId: testUserId,
       kdfSalt: fixtureRecoverySalt,
@@ -530,6 +542,7 @@ const seedV2Account = async (
     primaryKeyId: '0',
     schemeVersion: 2,
   }
+  return ak
 }
 
 /** Build a v1 (legacy) account: an AES-GCM CK, a no-AAD v1 canary, and a v1 envelope. */
@@ -553,7 +566,7 @@ const seedV1Account = async (
     primaryKeyId: '0',
     schemeVersion: 1,
   }
-  server.envelopes.set('test-device-id', await wrapAK(legacyCK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+  server.envelopes.set('test-device-id', await wrapLegacyCK(legacyCK, kp.ecdhPublicKey, kp.mlkemPublicKey))
   server.deviceTrusted.set('test-device-id', true)
   server.devicePublicKeys.set('test-device-id', {
     publicKey: await exportPublicKey(kp.ecdhPublicKey),
@@ -875,12 +888,19 @@ describe('encryption service (v2)', () => {
      * version — exactly the state another device's rotation leaves behind.
      */
     const rotateOnServer = async (server: FakeServer, kp: StoredKeyPair): Promise<CryptoKey> => {
-      const oldAK = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
+      const { ak: oldAK } = await unwrapAK(
+        server.envelopes.get('test-device-id')!,
+        kp.ecdhPrivateKey,
+        kp.mlkemSecretKey,
+      )
       const newAK = await generateAK(true)
       for (const [keyId, wrapped] of [...server.wrappedKeys]) {
         server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, keyId, true), newAK, keyId))
       }
-      server.envelopes.set('test-device-id', await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+      server.envelopes.set(
+        'test-device-id',
+        await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey, server.metadata!.primaryKeyId),
+      )
       server.metadata!.keyVersion += 1
       return newAK
     }
@@ -904,7 +924,7 @@ describe('encryption service (v2)', () => {
       expect(storedKeyVersion).toBe(2)
     })
 
-    it('refuses a steered primary key_id but still stages the keys (THU-876)', async () => {
+    it('ignores a steered metadata primary key_id but still stages the keys (THU-876/THU-890)', async () => {
       const server = createFakeServer()
       const kp = await generateFullKeyPair()
       storedKeyPair = kp
@@ -912,33 +932,54 @@ describe('encryption service (v2)', () => {
       await checkApprovalAndUnwrap(clientFor(server))
       expect(storedPrimaryKeyId).toBe('0')
 
-      // A2 points the primary at the decrypt-only legacy slot. Every DEK it
-      // serves is honest and opens under our AK — only the pointer is a lie.
+      // A2 points the metadata primary at the decrypt-only legacy slot. Every
+      // DEK it serves is honest and opens under our AK — only the pointer is a
+      // lie. Post-THU-890 the served pointer is ADVISORY: the fast path never
+      // stores a pointer at all (only an adopted envelope's sealed pointer is
+      // trusted), so the steer — and equally a grammar-valid rollback like
+      // `'0'` after a rotation — simply never reaches durable state.
       server.metadata!.primaryKeyId = 'v1'
       server.metadata!.keyVersion += 1
       storedDEKs.clear()
 
-      // `mockRestore` also clears the recorded calls, so collect them as they
-      // happen rather than reading the spy afterwards.
-      const errors: string[] = []
-      const consoleError = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
-        errors.push(args.map(String).join(' '))
-      })
-      try {
-        await stageKeyring(clientFor(server))
-      } finally {
-        consoleError.mockRestore()
-      }
+      await stageKeyring(clientFor(server))
 
-      // The steer is refused, loudly, and the primary already in force survives...
+      // The steer is ignored and the primary already in force survives...
       expect(storedPrimaryKeyId).toBe('0')
-      expect(errors.some((line) => line.includes("refused a non-mintable primary key_id from the server: 'v1'"))).toBe(
-        true,
-      )
-      // ...while the keys and the version still land. Refusing a pointer must
-      // not cost the device its reads, which is why this is skip-and-log rather
-      // than a throw: the DEKs are self-verifying, the pointer is not.
+      // ...while the keys and the version still land: the DEKs are
+      // self-verifying, the pointer is not, and ignoring it must not cost the
+      // device its reads.
       expect([...storedDEKs.keys()].sort()).toEqual(['0', 'v1'])
+      expect(storedKeyVersion).toBe(server.metadata!.keyVersion)
+    })
+
+    it('a grammar-valid pointer rollback in metadata never reaches durable state (THU-890)', async () => {
+      const server = createFakeServer()
+      const kp = await generateFullKeyPair()
+      storedKeyPair = kp
+      const seededAK = await seedV2Account(server, kp, await generateDEK(true))
+      await checkApprovalAndUnwrap(clientFor(server))
+
+      // A DEK mint moved the primary to '1' elsewhere; this device adopts the
+      // envelope that seals the new pointer (same AK — a pure mint, no AK
+      // rotation, keeps the witness and the staged keyring valid).
+      server.metadata!.primaryKeyId = '1'
+      server.wrappedKeys.set('1', (await mintDEK(seededAK, '1')).wrappedKey)
+      server.envelopes.set('test-device-id', await wrapAK(seededAK, kp.ecdhPublicKey, kp.mlkemPublicKey, '1'))
+      await refreshAK(clientFor(server))
+      expect(storedPrimaryKeyId).toBe('1')
+
+      // THE ROLLBACK (THU-890): A2 serves the old pointer '0' while the keyring
+      // still opens under the current AK — the exact move that used to steer
+      // new writes back onto the DEK a revoked device copied.
+      server.metadata!.primaryKeyId = '0'
+      server.metadata!.keyVersion += 1
+
+      await stageKeyring(clientFor(server))
+
+      // The fast path staged keys + version but the pointer never moved: it has
+      // no trusted source outside an adopted envelope, and no adoption happened.
+      expect(storedPrimaryKeyId).toBe('1')
       expect(storedKeyVersion).toBe(server.metadata!.keyVersion)
     })
 
@@ -973,7 +1014,7 @@ describe('encryption service (v2)', () => {
         void wrapped
         server.wrappedKeys.set(keyId, await wrapDEK(await generateDEK(true), attackerAK, keyId))
       }
-      server.envelopes.set('test-device-id', await wrapAK(attackerAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+      server.envelopes.set('test-device-id', await wrapAK(attackerAK, kp.ecdhPublicKey, kp.mlkemPublicKey, '0'))
       server.metadata!.keyVersion += 1
       return attackerAK
     }
@@ -1029,12 +1070,19 @@ describe('encryption service (v2)', () => {
       const anchorBefore = storedKeyringAnchor
 
       // A real rotation elsewhere: the SAME DEKs re-wrapped under a new AK.
-      const oldAK = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
+      const { ak: oldAK } = await unwrapAK(
+        server.envelopes.get('test-device-id')!,
+        kp.ecdhPrivateKey,
+        kp.mlkemSecretKey,
+      )
       const newAK = await generateAK(true)
       for (const [keyId, wrapped] of [...server.wrappedKeys]) {
         server.wrappedKeys.set(keyId, await wrapDEK(await unwrapDEK(wrapped, oldAK, keyId, true), newAK, keyId))
       }
-      server.envelopes.set('test-device-id', await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+      server.envelopes.set(
+        'test-device-id',
+        await wrapAK(newAK, kp.ecdhPublicKey, kp.mlkemPublicKey, server.metadata!.primaryKeyId),
+      )
       server.metadata!.keyVersion += 1
 
       await refreshAK(clientFor(server))
@@ -1076,7 +1124,7 @@ describe('encryption service (v2)', () => {
       const anchorBefore = storedKeyringAnchor
       expect(anchorBefore).not.toBeNull()
 
-      const ak = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
+      const { ak } = await unwrapAK(server.envelopes.get('test-device-id')!, kp.ecdhPrivateKey, kp.mlkemSecretKey)
       server.wrappedKeys.set(initialKeyId, await wrapDEK(await generateDEK(true), ak, initialKeyId))
       server.metadata!.keyVersion += 1
 
@@ -1254,7 +1302,7 @@ describe('encryption service (v2)', () => {
         fixtureRecoveryKeyPair.ecdhPrivateKey,
         fixtureRecoveryKeyPair.mlkemSecretKey,
       )
-      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')
+      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK.ak, '0')
       expect(dek0.algorithm.name).toBe('AES-GCM')
     })
 
@@ -1390,7 +1438,7 @@ describe('encryption service (v2)', () => {
       // server now holds, which in turn unwraps the live keyring.
       const rkp = await deriveRecoveryKeyPairFromSeed(decodeRecoveryKey(newPhrase), server.metadata!.kdfSalt!)
       const recoveredAK = await unwrapAK(server.metadata!.recoveryWrappedAk!, rkp.ecdhPrivateKey, rkp.mlkemSecretKey)
-      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')
+      const dek0 = await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK.ak, '0')
       expect(dek0.algorithm.name).toBe('AES-GCM')
     })
 
@@ -1438,7 +1486,7 @@ describe('encryption service (v2)', () => {
         fixtureRecoveryKeyPair.ecdhPrivateKey,
         fixtureRecoveryKeyPair.mlkemSecretKey,
       )
-      expect(await unwrapDEK(server.wrappedKeys.get('1')!, recoveredAK, '1')).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('1')!, recoveredAK.ak, '1')).toBeDefined()
     })
 
     it('ignores a planted out-of-grammar key_id when allocating the new primary (THU-871)', async () => {
@@ -1598,7 +1646,7 @@ describe('encryption service (v2)', () => {
       const rkp = await deriveRecoveryKeyPairFromSeed(decodeRecoveryKey(result.recoveryKey), server.metadata!.kdfSalt!)
       expect(server.metadata!.recoveryEcdhPublicKey).toBe(await exportPublicKey(rkp.ecdhPublicKey))
       const recoveredAK = await unwrapAK(server.metadata!.recoveryWrappedAk!, rkp.ecdhPrivateKey, rkp.mlkemSecretKey)
-      expect(await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK, '0')).toBeDefined()
+      expect(await unwrapDEK(server.wrappedKeys.get('0')!, recoveredAK.ak, '0')).toBeDefined()
     })
 
     it('covers this device from local keys even when the synced devices table is empty', async () => {
@@ -1651,7 +1699,7 @@ describe('encryption service (v2)', () => {
     const forgeEnvelopeAndCanary = async (server: FakeServer, kp: StoredKeyPair): Promise<void> => {
       const attackerCK = await generateDEK(true)
       const forgedCanary = await encrypt('thunderbolt-canary-v1:forged-secret', attackerCK)
-      server.envelopes.set('test-device-id', await wrapAK(attackerCK, kp.ecdhPublicKey, kp.mlkemPublicKey))
+      server.envelopes.set('test-device-id', await wrapLegacyCK(attackerCK, kp.ecdhPublicKey, kp.mlkemPublicKey))
       server.metadata!.canaryIv = forgedCanary.iv
       server.metadata!.canaryCtext = forgedCanary.ciphertext
     }

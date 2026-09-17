@@ -5,7 +5,6 @@
 import { decrypt, encrypt, getAK, getDEK, getPrimaryKeyId, unwrapDEK } from '@/crypto'
 import {
   encodeAAD,
-  initialKeyId,
   isMintableKeyId,
   legacyKeyId,
   type EncryptionCodec,
@@ -287,19 +286,21 @@ const resolvePrimaryKeyId = async (): Promise<KeyId | null> => {
     // poisoned before THU-876 shipped. Enforcing it HERE, at the point of use,
     // is what stops a transient compromise from becoming a permanent steer onto
     // the decrypt-only `"v1"` slot. Fail closed rather than falling through to
-    // the `initialKeyId` fallback below: a detected tamper is not the same
-    // condition as "no pointer yet", and silently writing under `"0"` would be
-    // the wrong key on any account that has since rotated.
+    // the null return below: a detected tamper is not the same condition as
+    // "no pointer yet", and must surface as its own loud error.
     throw new Error(`Refusing to encrypt under a non-mintable primary key_id: '${stored}'`)
   }
   if (stored) {
     cachedPrimaryKeyId = stored
     return stored
   }
-  if (await getDEK(initialKeyId)) {
-    cachedPrimaryKeyId = initialKeyId
-    return initialKeyId
-  }
+  // NO fallback to DEK "0" when the pointer is absent (THU-890). The pointer's
+  // only trusted source is a device's adopted AK envelope, so "no pointer"
+  // means "no verified envelope yet" — and silently sealing under "0" here was
+  // a downgrade primitive: any state that suppressed the pointer steered new
+  // writes back into the very DEK a revoked device copied. Returning null lets
+  // `encode` fail closed (loud, retryable — the connector defers the batch and
+  // nudges an envelope adoption).
   return null
 }
 

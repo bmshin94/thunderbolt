@@ -6,9 +6,8 @@ import { handleAppVersionUnsupported } from '@/lib/app-version-unsupported'
 import { getAuthenticatedHeaders, getAuthToken } from '@/lib/auth-token'
 import { isSsoMode } from '@/lib/auth-mode'
 import type { AbstractPowerSyncDatabase, PowerSyncBackendConnector, PowerSyncCredentials } from '@powersync/web'
-import { encodeForUpload } from '@/db/encryption'
-import { getAK, getPrimaryKeyId, storePrimaryKeyId } from '@/crypto'
-import { isMintableKeyId, type EncryptionMetadataResponse, type KeyId } from '@shared/e2ee-types'
+import { encodeForUpload, keysSyncChannelName, type KeysSyncMessage } from '@/db/encryption'
+import { getAK, getPrimaryKeyId } from '@/crypto'
 import { sanitizeErrorForTracking, trackSyncEvent } from './sync-tracker'
 
 /**
@@ -205,9 +204,7 @@ export class ThunderboltConnector implements PowerSyncBackendConnector {
    * A failed probe (offline, 401/403/5xx) is `unknown`, never `absent` — "not
    * encrypted" may only be concluded from an explicit 404.
    */
-  private async probeAccountEncryption(): Promise<
-    { status: 'set-up'; primaryKeyId: KeyId } | { status: 'absent' } | { status: 'unknown' }
-  > {
+  private async probeAccountEncryption(): Promise<{ status: 'set-up' | 'absent' | 'unknown' }> {
     try {
       const response = await this.fetchFn(`${this.backendUrl}/encryption/canary`, {
         headers: getAuthenticatedHeaders(),
@@ -216,11 +213,10 @@ export class ThunderboltConnector implements PowerSyncBackendConnector {
       if (response.status === 404) {
         return { status: 'absent' }
       }
-      if (!response.ok) {
-        return { status: 'unknown' }
-      }
-      const metadata = (await response.json()) as Pick<EncryptionMetadataResponse, 'primary_key_id'>
-      return { status: 'set-up', primaryKeyId: metadata.primary_key_id }
+      // The body (incl. `primary_key_id`) is DELIBERATELY not read: a served
+      // pointer is advisory only — the AK envelope is its trusted source
+      // (THU-890). Only the account's set-up-ness is consumed here.
+      return response.ok ? { status: 'set-up' } : { status: 'unknown' }
     } catch {
       return { status: 'unknown' }
     }
@@ -259,17 +255,35 @@ export class ThunderboltConnector implements PowerSyncBackendConnector {
     if (!(await getAK())) {
       throw new Error('Account is E2EE but this device holds no access key — deferring upload instead of plaintext')
     }
-    // Second place a server-reported pointer becomes durable local state (the
-    // other is `applyKeyring`), and it reads the same `/encryption/canary`
-    // response — so one lie steers both. A non-mintable id would seal this batch
-    // under the decrypt-only `"v1"` slot (THU-876); defer instead, which is what
-    // every other guard in this method does.
-    if (!isMintableKeyId(account.primaryKeyId)) {
-      throw new Error(
-        `Server reported a non-mintable primary key_id ('${account.primaryKeyId}') — deferring upload instead of encrypting under it`,
-      )
+    // AK present, pointer missing. This used to adopt `metadata.primary_key_id`
+    // — which made it the second place a SERVED pointer became durable local
+    // state, and the door a grammar-valid rollback walked through (THU-890:
+    // `"0"` served after a revocation moved the primary to `"1"` sealed new
+    // writes under the DEK the revoked device copied). The pointer's only
+    // trusted source is now the AK envelope, so: nudge the main-thread
+    // responder to re-adopt (its `stageKeyring` escalates to a witness-gated
+    // envelope adoption when the pointer is missing) and DEFER this batch —
+    // PowerSync retries it once the pointer lands.
+    this.requestPointerAdoption()
+    throw new Error('No verified primary key_id on this device yet — deferring upload until the envelope is adopted')
+  }
+
+  /**
+   * Ask the main-thread key-request responder to restore the missing pointer.
+   * Reuses the codec's keys-sync channel: `unknown-key` for DEK "0" routes to
+   * `stageKeyring`, which adopts this device's envelope (the pointer's trusted
+   * source) whenever the local pointer is null. Fire-and-forget — the responder
+   * has its own cooldown, and absence of BroadcastChannel (tests, exotic
+   * runtimes) must not turn a defer into a crash.
+   */
+  private requestPointerAdoption(): void {
+    if (typeof BroadcastChannel === 'undefined') {
+      return
     }
-    await storePrimaryKeyId(account.primaryKeyId)
+    const channel = new BroadcastChannel(keysSyncChannelName)
+    const message: KeysSyncMessage = { type: 'key-request', keyId: '0', reason: 'unknown-key' }
+    channel.postMessage(message)
+    channel.close()
   }
 
   /**

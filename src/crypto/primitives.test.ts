@@ -25,6 +25,7 @@ import {
   unwrapDEK,
   rewrapKeyring,
   unwrapLegacyCK,
+  wrapLegacyCK,
   encrypt,
   decrypt,
   encryptBytes,
@@ -177,17 +178,18 @@ describe('mintDEK', () => {
   })
 })
 
-describe('wrapAK / unwrapAK', () => {
-  it('round-trips AK through wrap and unwrap', async () => {
+describe('wrapAK / unwrapAK (v2 AEAD envelope, THU-890)', () => {
+  it('round-trips AK + sealed pointer through wrap and unwrap', async () => {
     const ecdh = await generateKeyPair()
     const mlkem = generateMlKemKeyPair()
     const ak = await generateAK(true)
 
-    const unwrapped = await unwrapAK(
-      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey),
+    const { ak: unwrapped, primaryKeyId } = await unwrapAK(
+      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey, '1'),
       ecdh.privateKey,
       mlkem.secretKey,
     )
+    expect(primaryKeyId).toBe('1')
     expect(unwrapped.algorithm.name).toBe('AES-GCM')
     expect(unwrapped.extractable).toBe(false)
     expect([...unwrapped.usages].sort()).toEqual(['unwrapKey', 'wrapKey'])
@@ -201,8 +203,8 @@ describe('wrapAK / unwrapAK', () => {
 
     const encrypted = await encrypt('wrap test', dek)
     const wrappedDek = await wrapDEK(dek, ak, '0')
-    const unwrappedAk = await unwrapAK(
-      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey),
+    const { ak: unwrappedAk } = await unwrapAK(
+      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey, '0'),
       ecdh.privateKey,
       mlkem.secretKey,
     )
@@ -213,25 +215,44 @@ describe('wrapAK / unwrapAK', () => {
     const ecdh = await generateKeyPair()
     const mlkem = generateMlKemKeyPair()
     const ak = await generateAK(true)
-    expect(await wrapAK(ak, ecdh.publicKey, mlkem.publicKey)).not.toBe(
-      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey),
+    expect(await wrapAK(ak, ecdh.publicKey, mlkem.publicKey, '0')).not.toBe(
+      await wrapAK(ak, ecdh.publicKey, mlkem.publicKey, '0'),
     )
   })
 
-  it('produces the unchanged v1 envelope byte layout and version (1194 bytes, 0x01)', async () => {
+  it('emits the v2 envelope version byte', async () => {
     const ecdh = await generateKeyPair()
     const mlkem = generateMlKemKeyPair()
-    const wrapped = await wrapAK(await generateAK(true), ecdh.publicKey, mlkem.publicKey)
+    const wrapped = await wrapAK(await generateAK(true), ecdh.publicKey, mlkem.publicKey, '0')
+    expect(base64ToUint8Array(wrapped)[0]).toBe(0x02)
+  })
 
-    expect(wrapped.length).toBe(1592) // base64 of 1194 bytes
+  it('rejects a tampered pointer — the seal covers (AK, pointer) jointly', async () => {
+    // The rollback move (THU-890): take a genuine current envelope and flip the
+    // pointer bytes. The pointer sits INSIDE the AEAD, so any flip breaks the
+    // tag — this is the property AES-KW could not provide.
+    const ecdh = await generateKeyPair()
+    const mlkem = generateMlKemKeyPair()
+    const wrapped = await wrapAK(await generateAK(true), ecdh.publicKey, mlkem.publicKey, '1')
+
     const envelope = base64ToUint8Array(wrapped)
-    expect(envelope.length).toBe(1194)
-    expect(envelope[0]).toBe(0x01)
+    // The sealed payload's final byte is the pointer's last character.
+    envelope[envelope.length - 1] ^= 0x01
+    const tampered = btoa(String.fromCharCode(...envelope))
+
+    await expect(unwrapAK(tampered, ecdh.privateKey, mlkem.secretKey)).rejects.toThrow('Failed to unwrap account key')
+  })
+
+  it('rejects a v1 (AES-KW) envelope — no silent downgrade to the pointerless layout', async () => {
+    const ecdh = await generateKeyPair()
+    const mlkem = generateMlKemKeyPair()
+    const legacy = await wrapLegacyCK(await generateAK(true), ecdh.publicKey, mlkem.publicKey)
+    await expect(unwrapAK(legacy, ecdh.privateKey, mlkem.secretKey)).rejects.toThrow('Unsupported AK envelope version')
   })
 })
 
 describe('rewrapAK', () => {
-  it('rewrapped AK unwraps a DEK wrapped with the original', async () => {
+  it('rewrapped AK unwraps a DEK wrapped with the original, and the pointer travels unchanged', async () => {
     const ecdh1 = await generateKeyPair()
     const mlkem1 = generateMlKemKeyPair()
     const ecdh2 = await generateKeyPair()
@@ -241,9 +262,10 @@ describe('rewrapAK', () => {
 
     const encrypted = await encrypt('rewrap test', dek)
     const wrappedDek = await wrapDEK(dek, ak, '0')
-    const wrappedAk = await wrapAK(ak, ecdh1.publicKey, mlkem1.publicKey)
+    const wrappedAk = await wrapAK(ak, ecdh1.publicKey, mlkem1.publicKey, '3')
     const rewrapped = await rewrapAK(wrappedAk, ecdh1.privateKey, mlkem1.secretKey, ecdh2.publicKey, mlkem2.publicKey)
-    const unwrappedAk = await unwrapAK(rewrapped, ecdh2.privateKey, mlkem2.secretKey)
+    const { ak: unwrappedAk, primaryKeyId } = await unwrapAK(rewrapped, ecdh2.privateKey, mlkem2.secretKey)
+    expect(primaryKeyId).toBe('3')
     expect(await decrypt(encrypted, await unwrapDEK(wrappedDek, unwrappedAk, '0'))).toBe('rewrap test')
   })
 })
@@ -335,11 +357,11 @@ describe('unwrapLegacyCK (WS3 absorption)', () => {
     const ecdh = await generateKeyPair()
     const mlkem = generateMlKemKeyPair()
 
-    // A v1 CK is an extractable AES-GCM key; wrapping its raw bytes with the
-    // hybrid envelope (via wrapAK) reproduces the byte-identical v1 envelope.
+    // A v1 CK is an extractable AES-GCM key; `wrapLegacyCK` reproduces the
+    // byte-identical v1 (AES-KW) envelope an old client would have written.
     const legacyCK = await generateDEK(true)
     const v1Value = await encrypt('legacy v1 secret', legacyCK) // v1 wrote with NO AAD
-    const envelope = await wrapAK(legacyCK, ecdh.publicKey, mlkem.publicKey)
+    const envelope = await wrapLegacyCK(legacyCK, ecdh.publicKey, mlkem.publicKey)
 
     const recovered = await unwrapLegacyCK(envelope, ecdh.privateKey, mlkem.secretKey)
     expect(recovered.algorithm.name).toBe('AES-GCM')
@@ -353,7 +375,7 @@ describe('unwrapLegacyCK (WS3 absorption)', () => {
     const mlkem = generateMlKemKeyPair()
     const wrongEcdh = await generateKeyPair()
     const wrongMlkem = generateMlKemKeyPair()
-    const envelope = await wrapAK(await generateDEK(true), ecdh.publicKey, mlkem.publicKey)
+    const envelope = await wrapLegacyCK(await generateDEK(true), ecdh.publicKey, mlkem.publicKey)
     await expect(unwrapLegacyCK(envelope, wrongEcdh.privateKey, wrongMlkem.secretKey)).rejects.toThrow(
       'Failed to unwrap legacy content key',
     )

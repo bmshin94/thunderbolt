@@ -3,7 +3,13 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js'
-import { dekWrapAAD, orgEnvelopeVersion, orgEscrowHkdfInfo, p256RawPublicKeyLength } from '@shared/e2ee-types'
+import {
+  dekWrapAAD,
+  orgEnvelopeVersion,
+  orgEscrowHkdfInfo,
+  p256RawPublicKeyLength,
+  type KeyId,
+} from '@shared/e2ee-types'
 import { DecryptionError, EncryptionError } from './errors'
 
 const ecdhAlgorithm = 'ECDH'
@@ -16,16 +22,32 @@ export const ivLength = 12
 const hkdfHash = 'SHA-256'
 
 // Hybrid envelope constants — byte layout is a wire contract, never change.
-// The envelope is byte-identical between v1 (wrapped CK) and v2 (wrapped AK);
-// only the wrapped payload's key type differs, which is why the v1-CK
-// absorption unwrap (`unwrapLegacyCK`) can share this derivation. The HKDF info
-// string predates the CK→AK rename; changing it would break every existing
-// envelope for zero security benefit.
+// v1 (0x01): [version][ephPub 65][mlkemCt 1088][AES-KW(key) 40] — the legacy CK
+// envelope, still read by `unwrapLegacyCK` for the v1→v2 absorption, and still
+// WRITTEN only by the e2e harness when it seeds a legacy account.
+// v2 (0x02): [version][ephPub 65][mlkemCt 1088][iv 12][AES-GCM(rawAK ‖ pointer)]
+// — the AK envelope (THU-890). The pointer rides INSIDE the AEAD so the GCM tag
+// covers (AK, primary_key_id) jointly: a server cannot re-pair the account's
+// real AK with a pointer of its choosing, because it never holds a cleartext AK
+// and any byte it flips breaks the tag. AES-KW could not do this — it takes no
+// AAD and wraps only bare key material, which is exactly why appending a
+// pointer to the v1 layout would have left it malleable.
 const envelopeVersion = 0x01
+const akEnvelopeVersion = 0x02
 const mlkemCiphertextLength = 1088
 const aesKwWrappedKeyLength = 40 // AES-KW(256-bit key) = 32 + 8
 const minEnvelopeLength = 1 + ephemeralPubKeyLength + mlkemCiphertextLength + aesKwWrappedKeyLength
+const rawAkLength = 32
+const gcmTagLength = 16
+// AK(32) + at least one pointer character + the GCM tag.
+const minAkEnvelopeLength =
+  1 + ephemeralPubKeyLength + mlkemCiphertextLength + ivLength + rawAkLength + 1 + gcmTagLength
 const hybridHkdfInfo = new TextEncoder().encode('thunderbolt-hybrid-ck-wrap-v1')
+// Distinct info for the v2 AEAD seal — the derived key drives a different
+// algorithm (AES-GCM vs AES-KW), so it gets its own derivation domain.
+const hybridSealHkdfInfo = new TextEncoder().encode('thunderbolt-hybrid-ak-seal-v2')
+/** The version byte doubles as the seal's AAD — parsing and AEAD must agree. */
+const akEnvelopeAad = new Uint8Array([akEnvelopeVersion])
 
 const mlkemAtRestHkdfInfo = new TextEncoder().encode('thunderbolt-mlkem-at-rest-v1')
 
@@ -281,13 +303,12 @@ export const rewrapKeyring = async (
  * ikm = ss_ecdh || ss_mlkem (64 bytes combined)
  * salt = ephPubRaw || mlkemCiphertext (binds derivation to both KEM transcripts)
  */
-const deriveHybridWrappingKey = async (
+const hybridHkdfInputs = async (
   ssEcdh: ArrayBuffer,
   ssMlkem: Uint8Array,
   ephPubRaw: Uint8Array,
   mlkemCiphertext: Uint8Array,
-  usage: 'wrapKey' | 'unwrapKey',
-): Promise<CryptoKey> => {
+): Promise<{ hkdfKey: CryptoKey; salt: Uint8Array }> => {
   // Concatenate both shared secrets as IKM
   const combinedSS = new Uint8Array(32 + 32)
   combinedSS.set(new Uint8Array(ssEcdh), 0)
@@ -298,7 +319,17 @@ const deriveHybridWrappingKey = async (
   salt.set(ephPubRaw, 0)
   salt.set(mlkemCiphertext, ephPubRaw.length)
 
-  const hkdfKey = await crypto.subtle.importKey('raw', combinedSS, 'HKDF', false, ['deriveKey'])
+  return { hkdfKey: await crypto.subtle.importKey('raw', combinedSS, 'HKDF', false, ['deriveKey']), salt }
+}
+
+const deriveHybridWrappingKey = async (
+  ssEcdh: ArrayBuffer,
+  ssMlkem: Uint8Array,
+  ephPubRaw: Uint8Array,
+  mlkemCiphertext: Uint8Array,
+  usage: 'wrapKey' | 'unwrapKey',
+): Promise<CryptoKey> => {
+  const { hkdfKey, salt } = await hybridHkdfInputs(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext)
   return crypto.subtle.deriveKey(
     { name: 'HKDF', hash: hkdfHash, salt: salt as BufferSource, info: hybridHkdfInfo },
     hkdfKey,
@@ -308,45 +339,186 @@ const deriveHybridWrappingKey = async (
   )
 }
 
+/** The v2 counterpart: an AES-GCM key for the AK envelope's AEAD seal. */
+const deriveHybridSealKey = async (
+  ssEcdh: ArrayBuffer,
+  ssMlkem: Uint8Array,
+  ephPubRaw: Uint8Array,
+  mlkemCiphertext: Uint8Array,
+  usage: 'encrypt' | 'decrypt',
+): Promise<CryptoKey> => {
+  const { hkdfKey, salt } = await hybridHkdfInputs(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext)
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: hkdfHash, salt: salt as BufferSource, info: hybridSealHkdfInfo },
+    hkdfKey,
+    { name: aesGcmAlgorithm, length: aesKeyLength },
+    false,
+    [usage],
+  )
+}
+
+/** Fresh hybrid transcript for one envelope: ephemeral ECDH + ML-KEM encapsulation. */
+const beginHybridSeal = async (
+  ecdhPublicKey: CryptoKey,
+  mlkemPublicKey: Uint8Array,
+): Promise<{ ephPubRaw: Uint8Array; mlkemCiphertext: Uint8Array; ssEcdh: ArrayBuffer; ssMlkem: Uint8Array }> => {
+  const ephemeral = await crypto.subtle.generateKey({ name: ecdhAlgorithm, namedCurve: ecdhCurve }, false, [
+    'deriveBits',
+  ])
+  const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey))
+  const ssEcdh = await crypto.subtle.deriveBits(
+    { name: ecdhAlgorithm, public: ecdhPublicKey },
+    ephemeral.privateKey,
+    256,
+  )
+  const { cipherText: mlkemCiphertext, sharedSecret: ssMlkem } = ml_kem768.encapsulate(mlkemPublicKey)
+  return { ephPubRaw, mlkemCiphertext, ssEcdh, ssMlkem }
+}
+
+/** Seal an opaque payload into a v2 AK envelope for one recipient. */
+const sealAkPayload = async (
+  payload: Uint8Array,
+  ecdhPublicKey: CryptoKey,
+  mlkemPublicKey: Uint8Array,
+): Promise<string> => {
+  const { ephPubRaw, mlkemCiphertext, ssEcdh, ssMlkem } = await beginHybridSeal(ecdhPublicKey, mlkemPublicKey)
+  const sealKey = await deriveHybridSealKey(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext, 'encrypt')
+  const iv = crypto.getRandomValues(new Uint8Array(ivLength))
+  const sealed = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: aesGcmAlgorithm, iv: iv as BufferSource, additionalData: akEnvelopeAad as BufferSource },
+      sealKey,
+      payload as BufferSource,
+    ),
+  )
+
+  const envelope = new Uint8Array(1 + ephPubRaw.length + mlkemCiphertext.length + iv.length + sealed.length)
+  envelope[0] = akEnvelopeVersion
+  envelope.set(ephPubRaw, 1)
+  envelope.set(mlkemCiphertext, 1 + ephPubRaw.length)
+  envelope.set(iv, 1 + ephPubRaw.length + mlkemCiphertext.length)
+  envelope.set(sealed, 1 + ephPubRaw.length + mlkemCiphertext.length + iv.length)
+  return uint8ArrayToBase64(envelope)
+}
+
 /**
- * Wrap AK using hybrid ECDH P-256 + ML-KEM-768.
- * Envelope: [version 1B][ephPubRaw 65B][mlkemCiphertext 1088B][wrappedAK 40B]
+ * Open a v2 AK envelope back to its payload bytes. Throws `DecryptionError` on
+ * a wrong recipient, a tampered byte anywhere (the transcript feeds the key
+ * derivation and the version byte is the AAD, so nothing outside the tag is
+ * malleable either), or a non-v2 version byte.
  */
-export const wrapAK = async (ak: CryptoKey, ecdhPublicKey: CryptoKey, mlkemPublicKey: Uint8Array): Promise<string> => {
+const openAkPayload = async (
+  wrappedBase64: string,
+  ecdhPrivateKey: CryptoKey,
+  mlkemSecretKey: Uint8Array,
+): Promise<Uint8Array> => {
+  const envelope = base64ToUint8Array(wrappedBase64)
+  if (envelope[0] !== akEnvelopeVersion) {
+    throw new DecryptionError(`Unsupported AK envelope version: ${envelope[0]}`)
+  }
+  if (envelope.length < minAkEnvelopeLength) {
+    throw new DecryptionError(`Invalid AK envelope: ${envelope.length} bytes, need >= ${minAkEnvelopeLength}`)
+  }
+
+  let offset = 1
+  const ephPubRaw = envelope.slice(offset, offset + ephemeralPubKeyLength)
+  offset += ephemeralPubKeyLength
+  const mlkemCiphertext = envelope.slice(offset, offset + mlkemCiphertextLength)
+  offset += mlkemCiphertextLength
+  const iv = envelope.slice(offset, offset + ivLength)
+  offset += ivLength
+  const sealed = envelope.slice(offset)
+
+  const ephemeralPublicKey = await crypto.subtle.importKey(
+    'raw',
+    ephPubRaw as BufferSource,
+    { name: ecdhAlgorithm, namedCurve: ecdhCurve },
+    false,
+    [],
+  )
+  const ssEcdh = await crypto.subtle.deriveBits(
+    { name: ecdhAlgorithm, public: ephemeralPublicKey },
+    ecdhPrivateKey,
+    256,
+  )
+  const ssMlkem = ml_kem768.decapsulate(mlkemCiphertext, mlkemSecretKey)
+  const sealKey = await deriveHybridSealKey(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext, 'decrypt')
+  return new Uint8Array(
+    await crypto.subtle.decrypt(
+      { name: aesGcmAlgorithm, iv: iv as BufferSource, additionalData: akEnvelopeAad as BufferSource },
+      sealKey,
+      sealed as BufferSource,
+    ),
+  )
+}
+
+/**
+ * Wrap the AK for one recipient using hybrid ECDH P-256 + ML-KEM-768, sealing
+ * the account's CURRENT `primary_key_id` into the same AEAD (THU-890).
+ * Envelope: [version=0x02][ephPubRaw 65B][mlkemCiphertext 1088B][iv 12B][AES-GCM(rawAK ‖ pointer)]
+ *
+ * The pointer travels INSIDE the tag on purpose: the envelope a device adopts
+ * after a rotation is the one artifact the server cannot forge (it never holds
+ * a cleartext AK), so making it the pointer's only trusted source is what stops
+ * a served `primary_key_id` rollback steering new writes onto a DEK a revoked
+ * device still holds. `ak` must be extractable (transiently, at mint time —
+ * same rule as the old AES-KW wrap).
+ */
+export const wrapAK = async (
+  ak: CryptoKey,
+  ecdhPublicKey: CryptoKey,
+  mlkemPublicKey: Uint8Array,
+  primaryKeyId: KeyId,
+): Promise<string> => {
   try {
-    // Ephemeral ECDH P-256
-    const ephemeral = await crypto.subtle.generateKey({ name: ecdhAlgorithm, namedCurve: ecdhCurve }, false, [
-      'deriveBits',
-    ])
-    const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey))
-    const ssEcdh = await crypto.subtle.deriveBits(
-      { name: ecdhAlgorithm, public: ecdhPublicKey },
-      ephemeral.privateKey,
-      256,
-    )
-
-    // ML-KEM-768 encapsulate
-    const { cipherText: mlkemCiphertext, sharedSecret: ssMlkem } = ml_kem768.encapsulate(mlkemPublicKey)
-
-    // Hybrid HKDF -> AES-KW key
-    const wrappingKey = await deriveHybridWrappingKey(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext, 'wrapKey')
-    const wrappedAKBytes = new Uint8Array(await crypto.subtle.wrapKey('raw', ak, wrappingKey, aesKwAlgorithm))
-
-    // Assemble versioned envelope
-    const envelope = new Uint8Array(1 + ephPubRaw.length + mlkemCiphertext.length + wrappedAKBytes.length)
-    envelope[0] = envelopeVersion
-    envelope.set(ephPubRaw, 1)
-    envelope.set(mlkemCiphertext, 1 + ephPubRaw.length)
-    envelope.set(wrappedAKBytes, 1 + ephPubRaw.length + mlkemCiphertext.length)
-    return uint8ArrayToBase64(envelope)
+    const rawAK = new Uint8Array(await crypto.subtle.exportKey('raw', ak))
+    const pointerBytes = new TextEncoder().encode(primaryKeyId)
+    const payload = new Uint8Array(rawAK.length + pointerBytes.length)
+    payload.set(rawAK, 0)
+    payload.set(pointerBytes, rawAK.length)
+    try {
+      return await sealAkPayload(payload, ecdhPublicKey, mlkemPublicKey)
+    } finally {
+      rawAK.fill(0)
+      payload.fill(0)
+    }
   } catch (err) {
     throw new EncryptionError('Failed to wrap account key', { cause: err })
   }
 }
 
 /**
- * Rewrap a wrapped AK for a different device's public keys.
- * Unwraps as temporarily extractable (in-memory only), then wraps with target's keys.
+ * Wrap a legacy CK into a v1 envelope: [version=0x01][ephPubRaw][mlkemCiphertext][AES-KW(key) 40B].
+ * Production never writes these any more — the ONLY writer is the e2e harness
+ * seeding a pre-migration account — but the layout must stay exact because
+ * `unwrapLegacyCK` (the v1→v2 absorption) reads it.
+ */
+export const wrapLegacyCK = async (
+  ck: CryptoKey,
+  ecdhPublicKey: CryptoKey,
+  mlkemPublicKey: Uint8Array,
+): Promise<string> => {
+  try {
+    const { ephPubRaw, mlkemCiphertext, ssEcdh, ssMlkem } = await beginHybridSeal(ecdhPublicKey, mlkemPublicKey)
+    const wrappingKey = await deriveHybridWrappingKey(ssEcdh, ssMlkem, ephPubRaw, mlkemCiphertext, 'wrapKey')
+    const wrappedBytes = new Uint8Array(await crypto.subtle.wrapKey('raw', ck, wrappingKey, aesKwAlgorithm))
+
+    const envelope = new Uint8Array(1 + ephPubRaw.length + mlkemCiphertext.length + wrappedBytes.length)
+    envelope[0] = envelopeVersion
+    envelope.set(ephPubRaw, 1)
+    envelope.set(mlkemCiphertext, 1 + ephPubRaw.length)
+    envelope.set(wrappedBytes, 1 + ephPubRaw.length + mlkemCiphertext.length)
+    return uint8ArrayToBase64(envelope)
+  } catch (err) {
+    throw new EncryptionError('Failed to wrap legacy content key', { cause: err })
+  }
+}
+
+/**
+ * Rewrap a wrapped AK for a different device's public keys — the approval path.
+ * Opens the sealed payload in memory and re-seals the EXACT bytes for the
+ * target, so the pointer sealed by the original writer travels unchanged: an
+ * approver cannot (and need not) restate it.
  */
 export const rewrapAK = async (
   wrappedAKBase64: string,
@@ -356,8 +528,12 @@ export const rewrapAK = async (
   targetMlkemPublicKey: Uint8Array,
 ): Promise<string> => {
   try {
-    const tempAK = await unwrapAKInternal(wrappedAKBase64, ecdhPrivateKey, mlkemSecretKey, true)
-    return wrapAK(tempAK, targetEcdhPublicKey, targetMlkemPublicKey)
+    const payload = await openAkPayload(wrappedAKBase64, ecdhPrivateKey, mlkemSecretKey)
+    try {
+      return await sealAkPayload(payload, targetEcdhPublicKey, targetMlkemPublicKey)
+    } finally {
+      payload.fill(0)
+    }
   } catch (err) {
     if (err instanceof EncryptionError) {
       throw err
@@ -366,19 +542,29 @@ export const rewrapAK = async (
   }
 }
 
-/** Unwrap AK using hybrid ECDH + ML-KEM. Returns non-extractable AES-KW CryptoKey. */
+/** An opened AK envelope: the key plus the pointer sealed with it (THU-890). */
+export type OpenedAkEnvelope = {
+  ak: CryptoKey
+  /** The `primary_key_id` the envelope's writer sealed in — the pointer's only trusted source. */
+  primaryKeyId: KeyId
+}
+
+/**
+ * Unwrap an AK envelope. Returns the non-extractable AK plus the sealed
+ * `primary_key_id` — the two are covered by ONE auth tag, so a caller can trust
+ * the pointer exactly as far as it trusts the AK.
+ */
 export const unwrapAK = async (
   wrappedBase64: string,
   ecdhPrivateKey: CryptoKey,
   mlkemSecretKey: Uint8Array,
-): Promise<CryptoKey> => unwrapAKInternal(wrappedBase64, ecdhPrivateKey, mlkemSecretKey, false)
+): Promise<OpenedAkEnvelope> => unwrapAKInternal(wrappedBase64, ecdhPrivateKey, mlkemSecretKey, false)
 
 /**
- * Parse a hybrid envelope and derive the AES-KW unwrapping key from the ECDH +
- * ML-KEM transcripts. Returns the derived key and the still-wrapped payload
- * bytes. The v1-CK envelope and the v2-AK envelope are byte-identical, so this
- * derivation is shared by both `unwrapAKInternal` and `unwrapLegacyCK`; only the
- * final `crypto.subtle.unwrapKey` (target key type/usages) differs.
+ * Parse a v1 (0x01) hybrid envelope and derive the AES-KW unwrapping key from
+ * the ECDH + ML-KEM transcripts. Returns the derived key and the still-wrapped
+ * payload bytes. Since the AK envelope moved to the v2 AEAD layout (THU-890),
+ * the ONLY remaining reader is `unwrapLegacyCK` — the v1→v2 CK absorption.
  */
 const deriveEnvelopeUnwrap = async (
   wrappedBase64: string,
@@ -420,26 +606,34 @@ const deriveEnvelopeUnwrap = async (
 }
 
 /**
- * Internal hybrid unwrap of the AK with configurable extractability.
- * extractable=true is used only in rewrapAK (temporary, in-memory only).
+ * Internal open of a v2 AK envelope with configurable extractability
+ * (extractable=true exists for tests only — production always imports the AK
+ * non-extractable and `rewrapAK` never materialises a CryptoKey at all).
  */
 const unwrapAKInternal = async (
   wrappedBase64: string,
   ecdhPrivateKey: CryptoKey,
   mlkemSecretKey: Uint8Array,
   extractable: boolean,
-): Promise<CryptoKey> => {
+): Promise<OpenedAkEnvelope> => {
   try {
-    const { unwrappingKey, wrappedKeyBytes } = await deriveEnvelopeUnwrap(wrappedBase64, ecdhPrivateKey, mlkemSecretKey)
-    return await crypto.subtle.unwrapKey(
-      'raw',
-      wrappedKeyBytes as BufferSource,
-      unwrappingKey,
-      aesKwAlgorithm,
-      { name: aesGcmAlgorithm, length: aesKeyLength },
-      extractable,
-      ['wrapKey', 'unwrapKey'],
-    )
+    const payload = await openAkPayload(wrappedBase64, ecdhPrivateKey, mlkemSecretKey)
+    try {
+      if (payload.length <= rawAkLength) {
+        throw new DecryptionError('AK envelope payload carries no primary key_id')
+      }
+      const ak = await crypto.subtle.importKey(
+        'raw',
+        payload.slice(0, rawAkLength) as BufferSource,
+        { name: aesGcmAlgorithm, length: aesKeyLength },
+        extractable,
+        ['wrapKey', 'unwrapKey'],
+      )
+      const primaryKeyId = new TextDecoder().decode(payload.slice(rawAkLength))
+      return { ak, primaryKeyId }
+    } finally {
+      payload.fill(0)
+    }
   } catch (err) {
     if (err instanceof DecryptionError) {
       throw err

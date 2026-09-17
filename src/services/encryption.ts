@@ -51,7 +51,9 @@ import {
   stageWrappedDEKs,
   pruneStagedDEKs,
   storePrimaryKeyId,
+  getPrimaryKeyId,
   storeKeyVersion,
+  type OpenedAkEnvelope,
   storeKeyringAnchor,
   getKeyringAnchor,
   mintKeyringAnchor,
@@ -386,13 +388,14 @@ const buildRecoverySlot = async (
   recovery: RecoveryPublicKeys,
   kdfSalt: string,
   canaryKey: CryptoKey,
+  primaryKeyId: KeyId,
 ): Promise<RecoverySlotRequest> => {
   const recoveryEcdhPublicKey = await exportPublicKey(recovery.ecdhPublicKey)
   const recoveryMlkemPublicKey = exportMlKemPublicKey(recovery.mlkemPublicKey)
   return {
     recoveryEcdhPublicKey,
     recoveryMlkemPublicKey,
-    recoveryWrappedAK: await wrapAK(ak, recovery.ecdhPublicKey, recovery.mlkemPublicKey),
+    recoveryWrappedAK: await wrapAK(ak, recovery.ecdhPublicKey, recovery.mlkemPublicKey, primaryKeyId),
     recoveryAttestation: await signRecoveryAttestation(canaryKey, {
       userId: getUserId(),
       kdfSalt,
@@ -679,8 +682,8 @@ const acceptCandidateAK = async (httpClient: HttpClient, candidate: CryptoKey): 
   return keyring
 }
 
-/** Unwrap an AK envelope with this device's transport keys. */
-const unwrapEnvelopeAK = async (wrappedCK: string): Promise<CryptoKey> => {
+/** Unwrap an AK envelope with this device's transport keys — key + sealed pointer. */
+const unwrapEnvelopeAK = async (wrappedCK: string): Promise<OpenedAkEnvelope> => {
   const keyPair = await getKeyPair()
   if (!keyPair) {
     throw new Error('Key pair not found in IndexedDB')
@@ -690,15 +693,20 @@ const unwrapEnvelopeAK = async (wrappedCK: string): Promise<CryptoKey> => {
 
 /**
  * Re-fetch this device's envelope and adopt the AK it carries, subject to the
- * DEK `"0"` witness check. Returns the verified keyring.
+ * DEK `"0"` witness check. Returns the verified keyring plus the pointer sealed
+ * into the envelope — the pointer's ONLY trusted source (THU-890): it shares
+ * the AK's auth tag, so the server cannot pair the account's real current AK
+ * with a pointer of its choosing.
  *
  * A 404 propagates: for `refreshAK` a missing envelope means this device was
  * revoked, which must surface rather than look like a no-op. The one caller that
  * reads 404 as "not approved yet" narrows that catch itself.
  */
-const adoptEnvelopeAK = async (httpClient: HttpClient): Promise<FetchedKeyring> => {
+const adoptEnvelopeAK = async (httpClient: HttpClient): Promise<{ keyring: FetchedKeyring; primaryKeyId: KeyId }> => {
   const { wrappedCK } = await fetchMyEnvelope(httpClient)
-  return acceptCandidateAK(httpClient, await unwrapEnvelopeAK(wrappedCK))
+  const envelope = await unwrapEnvelopeAK(wrappedCK)
+  const keyring = await acceptCandidateAK(httpClient, envelope.ak)
+  return { keyring, primaryKeyId: envelope.primaryKeyId }
 }
 
 /**
@@ -730,7 +738,16 @@ const keyringUnwrapsUnderLocalAK = async (keyring: FetchedKeyring): Promise<bool
   )
 }
 
-const applyKeyring = async (keyring: FetchedKeyring): Promise<void> => {
+/**
+ * @param adoptedPrimaryKeyId - the pointer sealed into a JUST-ADOPTED AK
+ *   envelope, when this apply follows an adoption. The served
+ *   `metadata.primary_key_id` is NEVER stored (THU-890) — it is advisory: a
+ *   grammar-valid rollback (`"0"` served after a rotation moved the primary to
+ *   `"1"`) would re-open every key a revoked device copied. On the fast path
+ *   (the stored AK still opens the keyring — same epoch) the pointer cannot
+ *   have moved, so it is deliberately left alone.
+ */
+const applyKeyring = async (keyring: FetchedKeyring, adoptedPrimaryKeyId?: KeyId): Promise<void> => {
   // Witness DEK "0" BEFORE the staging below, so an established device mints
   // from the blob it already held rather than the one now arriving.
   await reconcileKeyringAnchor()
@@ -739,17 +756,17 @@ const applyKeyring = async (keyring: FetchedKeyring): Promise<void> => {
   // key_id that is gone server-side would otherwise keep a stale wrapped blob
   // here forever, which resolves to a permanent `unwrap-failed` (THU-871).
   await pruneStagedDEKs(keyring.keys.map((key) => key.key_id))
-  // The pointer is the one piece of keyring state that is NOT self-verifying:
-  // every DEK has to unwrap under the stored AK, the pointer has to be taken on
-  // trust. A non-mintable id is therefore a steer — most sharply onto the
-  // decrypt-only `"v1"` slot, whose CK any v1-era phrase or device opens
-  // (THU-876). Refuse it and keep the primary already in force, rather than
-  // rejecting the whole keyring: the DEKs above are legitimate and needed for
-  // reads, so failing here would turn a steer into a read outage.
-  if (isMintableKeyId(keyring.primaryKeyId)) {
-    await storePrimaryKeyId(keyring.primaryKeyId)
-  } else {
-    console.error(`[e2ee] refused a non-mintable primary key_id from the server: '${keyring.primaryKeyId}'`)
+  // A non-mintable id is a steer — most sharply onto the decrypt-only `"v1"`
+  // slot (THU-876) — even when it arrives sealed by an honest writer's bug.
+  // Refuse it and keep the primary already in force, rather than rejecting the
+  // whole keyring: the DEKs above are legitimate and needed for reads, so
+  // failing here would turn a steer into a read outage.
+  if (adoptedPrimaryKeyId !== undefined) {
+    if (isMintableKeyId(adoptedPrimaryKeyId)) {
+      await storePrimaryKeyId(adoptedPrimaryKeyId)
+    } else {
+      console.error(`[e2ee] refused a non-mintable primary key_id from the adopted envelope: '${adoptedPrimaryKeyId}'`)
+    }
   }
   await storeKeyVersion(keyring.keyVersion)
   // Again, for a device being ESTABLISHED: before the staging above it had no
@@ -784,13 +801,18 @@ const applyKeyring = async (keyring: FetchedKeyring): Promise<void> => {
  */
 export const stageKeyring = async (httpClient: HttpClient): Promise<void> => {
   const keyring = await fetchKeyring(httpClient)
-  if (await keyringUnwrapsUnderLocalAK(keyring)) {
+  // The fast path also requires a local pointer: the pointer's only trusted
+  // source is the AK envelope (THU-890), so a device that somehow lost its
+  // pointer alone must re-adopt to restore it — never take the metadata value.
+  if ((await getPrimaryKeyId()) !== null && (await keyringUnwrapsUnderLocalAK(keyring))) {
     await applyKeyring(keyring)
     return
   }
-  // Behind a rotation. Adopt, and apply the keyring the adoption VERIFIED —
-  // not the one fetched above, which was never tied to the new AK.
-  await applyKeyring(await adoptEnvelopeAK(httpClient))
+  // Behind a rotation (or missing its pointer). Adopt, and apply the keyring
+  // the adoption VERIFIED — not the one fetched above, which was never tied to
+  // the new AK — with the pointer the envelope sealed.
+  const adopted = await adoptEnvelopeAK(httpClient)
+  await applyKeyring(adopted.keyring, adopted.primaryKeyId)
 }
 
 /**
@@ -808,7 +830,8 @@ export const stageKeyring = async (httpClient: HttpClient): Promise<void> => {
  * `() => refreshAK(client)`.
  */
 export const refreshAK = async (httpClient: HttpClient): Promise<void> => {
-  await applyKeyring(await adoptEnvelopeAK(httpClient))
+  const adopted = await adoptEnvelopeAK(httpClient)
+  await applyKeyring(adopted.keyring, adopted.primaryKeyId)
 }
 
 /**
@@ -867,8 +890,14 @@ export const completeFirstDeviceSetup = async (httpClient: HttpClient): Promise<
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(extractableAK, getUserId())
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
-  const wrappedCK = await wrapAK(extractableAK, keyPair.ecdhPublicKey, keyPair.mlkemPublicKey)
-  const recoverySlot = await buildRecoverySlot(extractableAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
+  const wrappedCK = await wrapAK(extractableAK, keyPair.ecdhPublicKey, keyPair.mlkemPublicKey, initialKeyId)
+  const recoverySlot = await buildRecoverySlot(
+    extractableAK,
+    recovery.publicKeys,
+    recovery.kdfSalt,
+    canaryKey,
+    initialKeyId,
+  )
   const ak = await reimportAsNonExtractable(extractableAK)
 
   await storeEnvelope(httpClient, {
@@ -1027,7 +1056,8 @@ export const checkApprovalAndUnwrap = async (httpClient: HttpClient): Promise<bo
     return false
   }
 
-  await applyKeyring(await acceptCandidateAK(httpClient, await unwrapEnvelopeAK(envelope.wrappedCK)))
+  const opened = await unwrapEnvelopeAK(envelope.wrappedCK)
+  await applyKeyring(await acceptCandidateAK(httpClient, opened.ak), opened.primaryKeyId)
   return true
 }
 
@@ -1075,7 +1105,7 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
     throw new ValidationError('Invalid recovery key')
   }
 
-  const ak = await unwrapAK(
+  const { ak, primaryKeyId: sealedPrimaryKeyId } = await unwrapAK(
     metadata.recovery_wrapped_ak,
     recoveryKeyPair.ecdhPrivateKey,
     recoveryKeyPair.mlkemSecretKey,
@@ -1144,6 +1174,10 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
   if (!hadLocalAK) {
     await storeKeyringAnchor(await mintKeyringAnchor(dek0))
   }
+  // The pointer sealed into the recovery envelope is this device's only trusted
+  // source for it (THU-890) — stored BEFORE `stageKeyring`, whose fast path
+  // deliberately never writes a pointer.
+  await storePrimaryKeyId(sealedPrimaryKeyId)
   await stageKeyring(httpClient)
 }
 
@@ -1182,10 +1216,16 @@ const listTrustedDeviceKeys = async (httpClient: HttpClient): Promise<TrustedDev
   }))
 }
 
-/** Wrap `ak` into a device-envelope for each trusted device, honoring exclusions. */
+/**
+ * Wrap `ak` into a device-envelope for each trusted device, honoring exclusions.
+ * `primaryKeyId` is sealed into every envelope (THU-890) — the writer always
+ * knows it locally (the minted id, or its own verified pointer), so no served
+ * value is ever laundered into a seal.
+ */
 const buildDeviceEnvelopes = async (
   ak: CryptoKey,
   trustedDevices: TrustedDevicePublicKeys[],
+  primaryKeyId: KeyId,
   excludeDeviceIds: string[] = [],
 ): Promise<Array<{ deviceId: string; wrappedCK: string }>> => {
   const excluded = new Set(excludeDeviceIds)
@@ -1196,7 +1236,7 @@ const buildDeviceEnvelopes = async (
     }
     const ecdhPub = await importPublicKey(device.publicKey)
     const mlkemPub = importMlKemPublicKey(device.mlkemPublicKey)
-    envelopes.push({ deviceId: device.id, wrappedCK: await wrapAK(ak, ecdhPub, mlkemPub) })
+    envelopes.push({ deviceId: device.id, wrappedCK: await wrapAK(ak, ecdhPub, mlkemPub, primaryKeyId) })
   }
   return envelopes
 }
@@ -1349,23 +1389,38 @@ const runAKRotation = async (
     ? { keyId: mintedKeyId, wrappedKey: (await mintDEK(newAK, mintedKeyId)).wrappedKey }
     : undefined
 
+  // The pointer sealed into every envelope this rotation issues (THU-890): the
+  // freshly minted id, or — on a non-mint rotation — this device's OWN stored
+  // pointer, which itself only ever came from an adopted envelope. Never a
+  // served metadata value, so a rollback cannot be laundered into a seal.
+  const sealedPrimaryKeyId = mintedKeyId ?? (await getPrimaryKeyId())
+  if (!sealedPrimaryKeyId) {
+    throw new Error('No local primary key_id — cannot seal envelopes for this rotation')
+  }
+
   // New-AK envelope for every live trusted device, minus explicit exclusions
   // (a just-revoked device may still look trusted through sync lag).
   const trustedDevices = await (opts.listTrustedDevices ?? (() => listTrustedDeviceKeys(httpClient)))()
-  const envelopes = await buildDeviceEnvelopes(newAK, trustedDevices, opts.excludeDeviceIds)
+  const envelopes = await buildDeviceEnvelopes(newAK, trustedDevices, sealedPrimaryKeyId, opts.excludeDeviceIds)
 
-  // New canary under DEK '0' (the DEK itself did not change) + new signing
-  // keypair. Independent of the phrase, so this happens in BOTH modes: a
-  // revoked device knows the old canary secret and could otherwise keep forging
-  // approve/revoke/rotate proofs.
+  // New canary under the NEW AK (THU-872) + new signing keypair. Independent of
+  // the phrase, so this happens in BOTH modes — and it is what revocation's
+  // bite rests on: the revoked device never receives the new AK, so its signing
+  // identity dies with the old epoch.
   //
   // Minted BEFORE the recovery slot: the slot's attestation must be signed with
-  // the NEW canary secret, since that is the key the next rotation will derive
+  // the NEW canary key, since that is the key the next rotation will derive
   // to verify it (THU-865).
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(newAK, getUserId())
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
-  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
+  const recoverySlot = await buildRecoverySlot(
+    newAK,
+    recovery.publicKeys,
+    recovery.kdfSalt,
+    canaryKey,
+    sealedPrimaryKeyId,
+  )
 
   // Built OUTSIDE the try below: a malformed escrow pin is a build
   // misconfiguration and must surface as-is, not masquerade as a stale-rotation 4xx.
@@ -1743,8 +1798,8 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
   const devicesToCover = trustedDevices.some((device) => device.id === self.id)
     ? trustedDevices
     : [self, ...trustedDevices]
-  const envelopes = await buildDeviceEnvelopes(newAK, devicesToCover)
-  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canaryKey)
+  const envelopes = await buildDeviceEnvelopes(newAK, devicesToCover, initialKeyId)
+  const recoverySlot = await buildRecoverySlot(newAK, recovery.publicKeys, recovery.kdfSalt, canaryKey, initialKeyId)
 
   const { nonce } = await fetchChallenge(httpClient, 'upgrade')
 
@@ -1950,7 +2005,11 @@ export const followToV2 = async (httpClient: HttpClient, opts: FollowToV2Options
     return { outcome: 'awaiting-approval' }
   }
 
-  const ak = await unwrapAK(envelope.wrappedCK, keyPair.ecdhPrivateKey, keyPair.mlkemSecretKey)
+  const { ak, primaryKeyId: sealedPrimaryKeyId } = await unwrapAK(
+    envelope.wrappedCK,
+    keyPair.ecdhPrivateKey,
+    keyPair.mlkemSecretKey,
+  )
 
   const fetched = await fetchKeyring(httpClient)
   const keyring: WrappedKeyEntry[] = fetched.keys.map((key) => ({ keyId: key.key_id, wrappedKey: key.wrapped_key }))
@@ -1967,7 +2026,7 @@ export const followToV2 = async (httpClient: HttpClient, opts: FollowToV2Options
   // No DEK "0" witness check here: a follow only runs with no local AK
   // (`ensureV2Encryption` short-circuits on one), so there is never an anchor to
   // check against. The v1 continuity check above is this path's anchor.
-  await applyKeyring(fetched)
+  await applyKeyring(fetched, sealedPrimaryKeyId)
 
   return { outcome: 'followed' }
 }
