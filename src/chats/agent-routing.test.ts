@@ -94,6 +94,7 @@ const hydrateSessionWith = (
     miniAppApprovalQueue: [],
     retryCount: 0,
     retriesExhausted: false,
+    stopping: false,
     selectedAgent: agent,
     selectedModel: mockModel,
     projectId,

@@ -18,7 +18,6 @@ const settingsSchema = z
   .object({
     // API Keys
     fireworksApiKey: z.string().default(''),
-    mistralApiKey: z.string().default(''),
     anthropicApiKey: z.string().default(''),
     exaApiKey: z.string().default(''),
     tinfoilApiKey: z.string().default(''),
@@ -141,9 +140,22 @@ const settingsSchema = z
     // E2E encryption — when true, devices must complete the trust flow before syncing
     e2eeEnabled: z.boolean().default(false),
 
+    // Intake role: mounts POST /v1/debug-transcripts/intake. Thunderbolt production only.
+    debugTranscriptIntakeEnabled: z.boolean().default(false),
+    // Relay role: where this deployment forwards user transcripts, and its client key.
+    // Both set = the share feature is enabled for this deployment's users.
+    debugTranscriptUpstreamUrl: z.string().trim().default(''),
+    debugTranscriptUpstreamKey: z.string().trim().default(''),
     // Rollout order: docs/self-hosting/configuration.md#cli-device-rollout.
     // Kill switch for the server-owned CLI device row.
     cliDeviceRegistrationEnabled: z.boolean().default(false),
+
+    // Whether a personal access token may reach the confidential (Tinfoil) routes.
+    // Off by default: confidential inference is the only managed tier a PAT cannot
+    // buy without an operator saying so, and a PAT is longer-lived than a session.
+    // Attestation and HPKE are the caller's, not ours, so nothing here weakens the
+    // confidentiality boundary — see backend/docs/pat-lifecycle.md.
+    confidentialApiKeysEnabled: z.boolean().default(false),
 
     // Minimum app version clients must run. Empty string disables enforcement.
     // Surfaced to the frontend via GET /config; clients below this hard-block until they update.
@@ -203,7 +215,17 @@ const settingsSchema = z
         input: '[REDACTED]',
       })
     }
+    const hasUpstreamUrl = data.debugTranscriptUpstreamUrl !== ''
+    const hasUpstreamKey = data.debugTranscriptUpstreamKey !== ''
+    if (hasUpstreamUrl !== hasUpstreamKey) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'debugTranscriptUpstreamUrl and debugTranscriptUpstreamKey must be set together',
+        path: [hasUpstreamUrl ? 'debugTranscriptUpstreamKey' : 'debugTranscriptUpstreamUrl'],
+      })
+    }
   })
+  .transform((data) => ({ ...data, debugTranscriptsEnabled: data.debugTranscriptUpstreamUrl !== '' }))
 
 export type Settings = z.infer<typeof settingsSchema>
 
@@ -325,7 +347,6 @@ const parseSettings = (): Settings => {
   const isDevelopment = process.env.NODE_ENV === 'development'
   const env = {
     fireworksApiKey: process.env.FIREWORKS_API_KEY || '',
-    mistralApiKey: process.env.MISTRAL_API_KEY || '',
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
     exaApiKey: process.env.EXA_API_KEY || '',
     tinfoilApiKey: process.env.TINFOIL_API_KEY || '',
@@ -402,7 +423,11 @@ const parseSettings = (): Settings => {
     corsAllowHeaders: process.env.CORS_ALLOW_HEADERS || '',
     corsExposeHeaders: process.env.CORS_EXPOSE_HEADERS || defaultCorsExposeHeaders,
     e2eeEnabled: process.env.E2EE_ENABLED === 'true',
+    debugTranscriptIntakeEnabled: process.env.DEBUG_TRANSCRIPT_INTAKE_ENABLED === 'true',
+    debugTranscriptUpstreamUrl: process.env.DEBUG_TRANSCRIPT_UPSTREAM_URL || '',
+    debugTranscriptUpstreamKey: process.env.DEBUG_TRANSCRIPT_UPSTREAM_KEY || '',
     cliDeviceRegistrationEnabled: process.env.CLI_DEVICE_REGISTRATION_ENABLED === 'true',
+    confidentialApiKeysEnabled: process.env.CONFIDENTIAL_API_KEYS_ENABLED === 'true',
     minAppVersion: process.env.MIN_APP_VERSION || '',
     swaggerEnabled: process.env.SWAGGER_ENABLED === 'true',
     rateLimitEnabled: process.env.RATE_LIMIT_ENABLED !== 'false',

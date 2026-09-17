@@ -192,6 +192,7 @@ export const hydrateStore = (state: {
       miniAppApprovalQueue: [],
       retryCount: 0,
       retriesExhausted: false,
+      stopping: false,
       selectedAgent: builtInAgent,
       selectedModel: state.selectedModel ?? defaultTestModel,
       // Mirrors production: a chat's project and originating app both come from

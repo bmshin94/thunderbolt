@@ -159,6 +159,7 @@ describe('chat-store', () => {
               selectedAgent: builtInAgent,
               retryCount: 0,
               retriesExhausted: false,
+              stopping: false,
               selectedModel: null as unknown as Model,
               projectId: null,
               miniAppId: null,

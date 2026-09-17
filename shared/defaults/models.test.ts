@@ -4,7 +4,16 @@
 
 import { describe, expect, test } from 'bun:test'
 import { hashValues } from '../lib/hash'
-import { defaultModelOpus5, defaultModels, defaultModelsVersion, hashModel, vendorSupportsImages } from './models'
+import {
+  defaultModelGlm53Flash,
+  defaultModelGlm53,
+  defaultModelId,
+  defaultModelOpus5,
+  defaultModels,
+  defaultModelsVersion,
+  hashModel,
+  modelSupportsImages,
+} from './models'
 
 /**
  * Snapshot pinning the shipped defaults to their declared version. When you
@@ -29,12 +38,32 @@ const computeMetadataHash = () =>
   defaultModels.map((model, index) => `${index}:${hashValues([model.vendor, model.description])}`).join('|')
 
 const expected = {
-  version: 4,
-  hash: '0:019af08a-c27b-7074-8aac-95315d1ef3fd:n56kdk|1:019f227e-d640-727d-ba12-d51bd7d0a3d6:bvaax2|2:019e7580-2b0e-719c-a43f-d2b56e7f31b4:-g7x2jr',
-  metadataHash: '0:vzhyk4|1:-x2wlw2|2:-cajkcl',
+  version: 6,
+  hash: '0:019af08a-c27b-7074-8aac-95315d1ef3fd:n56kdk|1:01a06dd7-67ee-75be-b957-2b746271c49d:-n92e4|2:019e7580-2b0e-719c-a43f-d2b56e7f31b4:-mx717t',
+  metadataHash: '0:vzhyk4|1:d17qpa|2:-cajkcl',
 }
 
 describe('defaultModels version snapshot', () => {
+  test('selects confidential Flash by default', () => {
+    expect(defaultModelId).toBe(defaultModelGlm53Flash.id)
+  })
+
+  test('preserves the confidential Flash row identity', () => {
+    expect(defaultModelGlm53Flash).toMatchObject({
+      id: '01a06dd7-67ee-75be-b957-2b746271c49d',
+      provider: 'tinfoil',
+      model: 'glm-5-3-flash',
+      isSystem: 1,
+      isConfidential: 1,
+      vendor: 'zhipu',
+      contextWindow: 131072,
+      toolUsage: 1,
+      supportsParallelToolCalls: 0,
+      startWithReasoning: 0,
+    })
+    expect(defaultModels.some(({ id }) => id === '019f227e-d640-727d-ba12-d51bd7d0a3d6')).toBe(false)
+  })
+
   test('ships Opus 5 as the sole model using its canonical id', () => {
     expect(defaultModelOpus5).toMatchObject({
       id: '019af08a-c27b-7074-8aac-95315d1ef3fd',
@@ -69,17 +98,21 @@ describe('defaultModels version snapshot', () => {
   })
 })
 
-describe('vendorSupportsImages', () => {
+describe('modelSupportsImages', () => {
+  test('supports images for GLM 5.3 Flash but not GLM 5.3', () => {
+    expect(modelSupportsImages(defaultModelGlm53Flash)).toBe(true)
+    expect(modelSupportsImages(defaultModelGlm53)).toBe(false)
+  })
+
   test('true for known vision vendors', () => {
-    expect(vendorSupportsImages('anthropic')).toBe(true)
-    expect(vendorSupportsImages('openai')).toBe(true)
-    expect(vendorSupportsImages('google')).toBe(true)
+    expect(modelSupportsImages({ vendor: 'anthropic', model: 'custom' })).toBe(true)
+    expect(modelSupportsImages({ vendor: 'openai', model: 'custom' })).toBe(true)
+    expect(modelSupportsImages({ vendor: 'google', model: 'custom' })).toBe(true)
   })
 
   test('false for unknown or absent vendors (no guessing for custom/local)', () => {
-    expect(vendorSupportsImages(null)).toBe(false)
-    expect(vendorSupportsImages(undefined)).toBe(false)
-    expect(vendorSupportsImages('ollama')).toBe(false)
-    expect(vendorSupportsImages('')).toBe(false)
+    expect(modelSupportsImages({ vendor: null, model: 'custom' })).toBe(false)
+    expect(modelSupportsImages({ vendor: 'ollama', model: 'custom' })).toBe(false)
+    expect(modelSupportsImages({ vendor: '', model: 'custom' })).toBe(false)
   })
 })

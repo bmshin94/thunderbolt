@@ -47,6 +47,7 @@ const makeSession = (id: string): ChatSession =>
     miniAppApprovalQueue: [],
     retryCount: 0,
     retriesExhausted: false,
+    stopping: false,
     selectedAgent: builtInAgent,
     selectedModel: { id: 'model-1' } as Model,
     projectId: null,

@@ -14,8 +14,8 @@ EVAL_SMOKE=1 bun run eval
 # Test only Opus
 EVAL_MODELS=opus bun run eval
 
-# Test the legacy engine only
-EVAL_ENGINES=legacy bun run eval
+# Test the Pi engine only
+EVAL_ENGINES=pi bun run eval
 
 # Test only Chat mode across all models
 EVAL_MODES=chat bun run eval
@@ -36,11 +36,10 @@ EVAL_MODELS=opus EVAL_MODES=search bun run eval
 
 The matrix is derived from `defaultModels`, so every shipped system model is included automatically. Each turn goes through `createBuiltInAdapter`, which applies the same routing as production:
 
-- Tool-capable `anthropic`, `openai`, `custom`, `openrouter`, and `thunderbolt` models use the Pi harness.
-- Other models, including `tinfoil`, use the legacy AI pipeline.
+- Every shipped eval model uses the Pi harness, including confidential models through their confidential transport.
 
 ```
-User prompt → createBuiltInAdapter() → Pi or legacy → UI message stream → Parse & Score
+User prompt → createBuiltInAdapter() → Pi harness → UI message stream → Parse & Score
 ```
 
 One in-memory database is initialized for the run and shared read-only by all scenarios. Each scenario gets a fresh thread id, which is reused across that scenario's turns so persistent Pi harness behavior matches production. The adapter is disconnected after the run.
@@ -223,8 +222,8 @@ Here are the three leading stories on AP News for February 16, 2026:
 Use these names in `EVAL_MODELS`:
 
 - `opus` — Opus 5
-- `flash` — DeepSeek V4 Flash
-- `glm` — GLM 5.2
+- `flash` — GLM 5.3 Flash
+- `glm` — GLM 5.3
 
 The slug map is intentionally explicit. Its unit test fails when `defaultModels` gains an entry without a stable eval slug.
 
@@ -287,7 +286,7 @@ Pi coding tools (`bash`, `read`, `write`, and `edit`) never contribute to web-ca
 
 ### Judge design
 
-Only the four semantic assertions above invoke an LLM judge; deterministic web-call counting never does. DeepSeek V4 Flash judges Opus. Opus judges Flash and GLM. A model never judges itself, and GLM is never a judge because its Tinfoil connection cannot be resolved through the OpenAI-compatible connection used here.
+The four semantic assertions above use an LLM judge; deterministic web-call counting never does. Opus judges every model, including itself, because confidential models cannot be reached through the judge's OpenAI-compatible connection. The "never judges itself" rule is suspended until another direct managed model is available.
 
 Judge scope is fixed by category:
 
@@ -418,7 +417,7 @@ Inference, Tinfoil, search, and universal-proxy routes reject unauthenticated re
 The repository needs these Actions secrets:
 
 - `ANTHROPIC_API_KEY` — Opus inference and Opus judge calls
-- `TINFOIL_API_KEY` — DeepSeek V4 Flash and confidential GLM inference
+- `TINFOIL_API_KEY` — inference for confidential models
 - `EXA_API_KEY` — web search tool calls
 
 ### Manual runs

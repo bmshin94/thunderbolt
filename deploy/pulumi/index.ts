@@ -22,6 +22,7 @@ const platform = config.get('platform') || 'fargate'
 const version = config.require('version')
 const minAppVersion = config.get('minAppVersion') ?? ''
 const cliDeviceRegistrationEnabled = config.getBoolean('cliDeviceRegistrationEnabled') ?? false
+const confidentialApiKeysEnabled = config.getBoolean('confidentialApiKeysEnabled') ?? false
 
 // --- Shared-stack architecture (Phase 1 scaffolding) ---
 //
@@ -73,7 +74,6 @@ if (isSharedStack) {
     aiSecrets: {
       anthropicApiKey: config.getSecret('anthropicApiKey') ?? pulumi.output(''),
       fireworksApiKey: config.getSecret('fireworksApiKey') ?? pulumi.output(''),
-      mistralApiKey: config.getSecret('mistralApiKey') ?? pulumi.output(''),
       thunderboltInferenceApiKey: config.getSecret('thunderboltInferenceApiKey') ?? pulumi.output(''),
       exaApiKey: config.getSecret('exaApiKey') ?? pulumi.output(''),
       tinfoilApiKey: config.getSecret('tinfoilApiKey') ?? pulumi.output(''),
@@ -134,6 +134,7 @@ if (isSharedStack) {
     tinfoilEnclaveUrl: config.get('tinfoilEnclaveUrl'),
     minAppVersion,
     cliDeviceRegistrationEnabled,
+    confidentialApiKeysEnabled,
   })
 
   module.exports = {
@@ -240,7 +241,6 @@ if (isSharedStack) {
     // AI provider keys — empty default so enterprise stacks don't need them set.
     anthropicApiKey: config.getSecret('anthropicApiKey') ?? pulumi.output(''),
     fireworksApiKey: config.getSecret('fireworksApiKey') ?? pulumi.output(''),
-    mistralApiKey: config.getSecret('mistralApiKey') ?? pulumi.output(''),
     thunderboltInferenceApiKey: config.getSecret('thunderboltInferenceApiKey') ?? pulumi.output(''),
     exaApiKey: config.getSecret('exaApiKey') ?? pulumi.output(''),
     tinfoilApiKey: config.getSecret('tinfoilApiKey') ?? pulumi.output(''),
@@ -337,6 +337,7 @@ if (isSharedStack) {
       tinfoilEnclaveUrl,
       minAppVersion,
       cliDeviceRegistrationEnabled,
+      confidentialApiKeysEnabled,
       behindCloudflareProxy: hasSubdomainRouting,
       albListener: listener,
       targetGroups: {

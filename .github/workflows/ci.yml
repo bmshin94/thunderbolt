@@ -49,6 +49,11 @@ jobs:
               - 'crates/**'
             agent-core:
               - 'shared/agent-core/**'
+              - 'scripts/agent-core-browser-check.ts'
+              - 'vite.config.ts'
+              - 'package.json'
+              - 'bun.lock'
+              - '.github/workflows/ci.yml'
             cli:
               - 'cli/**'
               - 'shared/agent-core/**'
@@ -56,6 +61,7 @@ jobs:
               - 'shared/defaults/models.ts'
               - 'shared/inference-usage.ts'
               - 'package.json'
+              - 'bun.lock'
             wasm-artifact:
               - 'src/acp/iroh/pkg/**'
             # Inputs that change the compiled wasm (README.md excluded — it doesn't).
@@ -247,13 +253,13 @@ jobs:
           echo "No untransformed Lingui macros in the bundle."
 
   # shared/agent-core is an isolated module (also consumed by cli/). Its unit tests
-  # are NOT part of the default `bun run test` — they only need to run when the
-  # module itself changes, so gate them on the agent-core path filter. Mirrors the
-  # `rust` job's detect-changes pattern and the `typescript` job's Bun setup.
+  # are NOT part of the default `bun run test`. Include dependency/build changes:
+  # a passing Bun import does not establish compatibility with browser runtimes.
   agent-core:
     needs: detect-changes
     if: needs.detect-changes.outputs.agent-core == 'true'
-    runs-on: ubuntu-latest
+    # WebKit's Linux build lacks the storage API required by the OPFS persistence check.
+    runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -261,7 +267,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -274,15 +280,21 @@ jobs:
           path: |
             ~/.bun/install/cache
             node_modules
-          key: bun-${{ hashFiles('bun.lock') }}
+          key: agent-core-bun-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            bun-
+            agent-core-bun-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
       - name: Run agent-core tests (5x)
         run: bun run test:agent-core:5x
+
+      - name: Install browser engines
+        run: bunx playwright install --with-deps chromium webkit
+
+      - name: Check production agent-core in browsers
+        run: bun run test:agent-core:browser
 
   # cli/ has its own bun.lock but imports selected shared runtime contracts, so its
   # tests and typecheck aren't reached by the `typescript` job. Gate on the `cli`
@@ -305,13 +317,22 @@ jobs:
         with:
           path: |
             ~/.bun/install/cache
+            node_modules
             cli/node_modules
-          key: cli-bun-${{ hashFiles('cli/bun.lock') }}
+          key: cli-bun-${{ hashFiles('bun.lock', 'cli/bun.lock') }}
           restore-keys: |
             cli-bun-
 
+      # Shared CLI imports need root packages, not root lifecycle scripts.
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
       - name: Install cli dependencies
         run: cd cli && bun install --frozen-lockfile
+
+      # Shared agent core resolves these from root while CLI code resolves them from cli/.
+      - name: Check shared CLI dependency versions
+        run: bun -e 'for (const name of ["@earendil-works/pi-ai", "openai"]) { const root = (await Bun.file(`node_modules/${name}/package.json`).json()).version; const cli = (await Bun.file(`cli/node_modules/${name}/package.json`).json()).version; if (root !== cli) throw new Error(`${name} root ${root} != CLI ${cli}`) }'
 
       - name: Type check cli
         run: cd cli && bun run typecheck
