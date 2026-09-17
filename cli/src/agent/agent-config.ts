@@ -19,6 +19,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SkillDefinition } from '../../../shared/agent-core/skills.ts'
 import { hasExactKeys, hasOnlyKeys, isNonblankString, isRecord, parseJson } from '../lib/json.ts'
+import { isLoopbackHost } from '../lib/loopback.ts'
 import { thunderboltHomeDir } from '../paths.ts'
 
 export type McpServerConfig = {
@@ -105,7 +106,7 @@ const parseMcpServer = (value: unknown): McpServerConfig | null => {
     // carry bearer tokens.
     const parsed = safeUrl(value.url)
     if (parsed === null) return null
-    if (parsed.protocol !== 'https:' && !isLoopback(parsed.hostname)) return null
+    if (parsed.protocol !== 'https:' && !isLoopbackHost(parsed.hostname)) return null
     return { id: value.id, transport: 'http', url: value.url, headers, trustTools: value.trustTools }
   }
 
@@ -119,24 +120,6 @@ const safeUrl = (value: string): URL | null => {
     return null
   }
 }
-
-/**
- * 127.0.0.0/8 in the only form it can reach here. Matching the *parsed*
- * hostname is what makes a plain pattern exact: the URL parser has already
- * canonicalized every numeric shorthand to a dotted quad (`127.1` and
- * `2130706433` both arrive as `127.0.0.1`) and rejects an out-of-range octet
- * outright, so there is nothing left to normalize.
- */
-const loopbackIpv4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
-
-/**
- * A prefix test would be wrong here: `127.0.0.1.evil.com` starts with `127.`
- * and resolves wherever its owner points it, which would hand a bearer token to
- * that host over plain http — the one thing the check exists to stop. IPv6
- * arrives bracketed, because `new URL('http://[::1]/').hostname` is `[::1]`.
- */
-const isLoopback = (hostname: string): boolean =>
-  hostname === 'localhost' || hostname === '[::1]' || loopbackIpv4.test(hostname)
 
 /**
  * Validate a parsed config document.

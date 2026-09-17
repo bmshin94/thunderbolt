@@ -12,7 +12,11 @@ extra configuration still binds loopback, still mints a fresh token per run, and
 
 `agent.json`, at `THUNDERBOLT_AGENT_CONFIG` or `agent.json` under the state root:
 
-```jsonc
+Strict JSON — the loader uses `JSON.parse`, so no comments and no trailing
+commas. Every key is checked, and one the transport does not own (`headers` on
+stdio, `command` on http) fails the file rather than being ignored.
+
+```json
 {
   "version": 1,
   "skills": [{ "name": "triage", "description": "Triage an incoming report", "instruction": "…" }],
@@ -22,16 +26,16 @@ extra configuration still binds loopback, still mints a fresh token per run, and
       "transport": "stdio",
       "command": "uvx",
       "args": ["mcp-server-fetch"],
-      "trustTools": true,
+      "trustTools": true
     },
     {
       "id": "tracker",
       "transport": "http",
       "url": "https://mcp.example.com/mcp",
       "headers": { "authorization": "Bearer …" },
-      "trustTools": false,
-    },
-  ],
+      "trustTools": false
+    }
+  ]
 }
 ```
 

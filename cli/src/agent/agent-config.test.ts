@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { describe, expect, it } from 'bun:test'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { agentConfigPath, emptyAgentConfig, loadAgentConfig, parseAgentConfig } from './agent-config.ts'
@@ -197,5 +197,19 @@ describe('loadAgentConfig', () => {
 
   it('falls back to the state root when the env override is unset', () => {
     expect(agentConfigPath({ THUNDERBOLT_HOME: '/tmp/state' })).toBe('/tmp/state/agent.json')
+  })
+})
+
+describe('the documented example', () => {
+  it('is strict JSON and a valid config', async () => {
+    // The loader is `JSON.parse`, so a doc example with a trailing comma or a
+    // comment hands whoever copies it a startup error. Parse it here instead.
+    const doc = await readFile(join(import.meta.dir, '../../docs/hosted-agent.md'), 'utf8')
+    const block = /```json\n([\s\S]*?)```/.exec(doc)
+    expect(block).not.toBeNull()
+
+    const parsed = parseAgentConfig(JSON.parse(block![1]!) as unknown)
+    expect(parsed?.skills).toHaveLength(1)
+    expect(parsed?.mcpServers.map((server) => server.id)).toEqual(['docs', 'tracker'])
   })
 })

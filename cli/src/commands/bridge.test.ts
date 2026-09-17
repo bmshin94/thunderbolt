@@ -216,12 +216,20 @@ describe('deployment configuration', () => {
     // The Dockerfile ships THUNDERBOLT_BRIDGE_HOST=0.0.0.0, so without this a
     // bare `docker run` publishes a process that spawns agents behind a secret
     // that only ever reached this process's stdout and changes every restart.
-    expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0' })).toThrow(
-      'THUNDERBOLT_BRIDGE_HOST requires THUNDERBOLT_BRIDGE_TOKEN',
-    )
+    expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0' })).toThrow('requires THUNDERBOLT_BRIDGE_TOKEN')
     expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0', THUNDERBOLT_BRIDGE_TOKEN: '' })).toThrow(
       'requires THUNDERBOLT_BRIDGE_TOKEN',
     )
+  })
+
+  test.each(['127.0.0.1', '::1', 'localhost'])('needs no token to pin loopback explicitly (%s)', (host) => {
+    // Spelling out the default is not opting out of it, so demanding a token
+    // here would be a confusing no-op.
+    expect(resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: host })).toBe(host)
+  })
+
+  test('names the offending address so the error is actionable', () => {
+    expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '10.0.0.5' })).toThrow('10.0.0.5')
   })
 
   test('still rejects a public bind whose token is too short', () => {

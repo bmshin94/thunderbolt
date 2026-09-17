@@ -23,6 +23,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import type { ServerWebSocket, Subprocess } from 'bun'
 import type { BridgeConfig } from '../agent/types.ts'
+import { isLoopbackHost } from '../lib/loopback.ts'
 
 /** Per-connection state: the spawned process this socket is pumping. `null`
  *  only in the instant between upgrade and `open` (or after a spawn failure). */
@@ -230,14 +231,19 @@ const loopbackHost = '127.0.0.1'
  * origin allowlist and token become the only thing between the internet and a
  * process that spawns agents.
  *
- * A public bind therefore **requires** an explicit `THUNDERBOLT_BRIDGE_TOKEN`
- * and refuses to start without one, mirroring the short-token throw above. The
- * generated fallback is right on loopback and wrong here twice over: it changes
- * on every restart, so a redeploy silently breaks every configured client, and
- * it is only ever written to this process's stdout — on a platform that
- * discards that, nobody can reach the agent at all. `cli/Dockerfile` ships
- * `THUNDERBOLT_BRIDGE_HOST=0.0.0.0`, so without this check a bare `docker run`
- * would publish a process that spawns agents behind a secret nobody has.
+ * A bind **beyond** loopback therefore requires an explicit
+ * `THUNDERBOLT_BRIDGE_TOKEN` and refuses to start without one, mirroring the
+ * short-token throw above. The generated fallback is right on loopback and
+ * wrong here twice over: it changes on every restart, so a redeploy silently
+ * breaks every configured client, and it is only ever written to this process's
+ * stdout — on a platform that discards that, nobody can reach the agent at all.
+ * `cli/Dockerfile` ships `THUNDERBOLT_BRIDGE_HOST=0.0.0.0`, so without this
+ * check a bare `docker run` would publish a process that spawns agents behind a
+ * secret nobody has.
+ *
+ * The check is on the address, not on the variable being set: pinning
+ * `127.0.0.1` explicitly is the default spelled out, and demanding a token for
+ * it would be a confusing no-op.
  *
  * `THUNDERBOLT_APP_ORIGIN` is deliberately not required alongside it: omitting
  * it announces itself — every browser upgrade is refused with a 403 naming the
@@ -247,10 +253,11 @@ const loopbackHost = '127.0.0.1'
 export const resolveBridgeHost = (env: NodeJS.ProcessEnv = process.env): string => {
   const configured = env.THUNDERBOLT_BRIDGE_HOST
   if (!configured) return loopbackHost
-  if (!env.THUNDERBOLT_BRIDGE_TOKEN) {
+  if (!isLoopbackHost(configured) && !env.THUNDERBOLT_BRIDGE_TOKEN) {
     throw new Error(
-      'THUNDERBOLT_BRIDGE_HOST requires THUNDERBOLT_BRIDGE_TOKEN: a bind beyond loopback needs a stable ' +
-        'secret, and the per-run generated one changes on every restart. See cli/docs/hosted-agent.md.',
+      `THUNDERBOLT_BRIDGE_HOST=${configured} binds beyond loopback and requires THUNDERBOLT_BRIDGE_TOKEN: ` +
+        'a reachable bridge needs a stable secret, and the per-run generated one changes on every restart. ' +
+        'See cli/docs/hosted-agent.md.',
     )
   }
   return configured
