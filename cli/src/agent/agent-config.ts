@@ -18,7 +18,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SkillDefinition } from '../../../shared/agent-core/skills.ts'
-import { hasExactKeys, isNonblankString, isRecord, parseJson } from '../lib/json.ts'
+import { hasExactKeys, hasOnlyKeys, isNonblankString, isRecord, parseJson } from '../lib/json.ts'
 import { thunderboltHomeDir } from '../paths.ts'
 
 export type McpServerConfig = {
@@ -71,23 +71,35 @@ const parseSkill = (value: unknown): SkillDefinition | null => {
   return { name: value.name, description: value.description, instruction: value.instruction }
 }
 
+/**
+ * The keys each transport owns. A server is rejected for carrying a key from
+ * the other one — `headers` on stdio, `command` on http — rather than having it
+ * quietly dropped: an operator who wrote auth headers meant them to be sent,
+ * and an agent that starts while ignoring half its config is exactly the silent
+ * downgrade this parser exists to prevent.
+ */
+const stdioKeys = ['id', 'transport', 'trustTools', 'command', 'args', 'env'] as const
+const httpKeys = ['id', 'transport', 'trustTools', 'url', 'headers'] as const
+
 const parseMcpServer = (value: unknown): McpServerConfig | null => {
   if (!isRecord(value) || !isNonblankString(value.id)) return null
   if (typeof value.trustTools !== 'boolean') return null
 
-  const env = parseStringRecord(value.env)
-  const headers = parseStringRecord(value.headers)
-  if (env === null || headers === null) return null
-
   if (value.transport === 'stdio') {
+    if (!hasOnlyKeys(value, stdioKeys)) return null
     if (!isNonblankString(value.command)) return null
     const args = value.args === undefined ? [] : value.args
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) return null
+    const env = parseStringRecord(value.env)
+    if (env === null) return null
     return { id: value.id, transport: 'stdio', command: value.command, args, env, trustTools: value.trustTools }
   }
 
   if (value.transport === 'http') {
+    if (!hasOnlyKeys(value, httpKeys)) return null
     if (!isNonblankString(value.url)) return null
+    const headers = parseStringRecord(value.headers)
+    if (headers === null) return null
     // Refuse plain http to anywhere but loopback: a served agent runs on a host
     // whose network is not the operator's laptop, and MCP headers routinely
     // carry bearer tokens.
@@ -108,8 +120,23 @@ const safeUrl = (value: string): URL | null => {
   }
 }
 
+/**
+ * 127.0.0.0/8 in the only form it can reach here. Matching the *parsed*
+ * hostname is what makes a plain pattern exact: the URL parser has already
+ * canonicalized every numeric shorthand to a dotted quad (`127.1` and
+ * `2130706433` both arrive as `127.0.0.1`) and rejects an out-of-range octet
+ * outright, so there is nothing left to normalize.
+ */
+const loopbackIpv4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
+
+/**
+ * A prefix test would be wrong here: `127.0.0.1.evil.com` starts with `127.`
+ * and resolves wherever its owner points it, which would hand a bearer token to
+ * that host over plain http — the one thing the check exists to stop. IPv6
+ * arrives bracketed, because `new URL('http://[::1]/').hostname` is `[::1]`.
+ */
 const isLoopback = (hostname: string): boolean =>
-  hostname === 'localhost' || hostname === '::1' || hostname.startsWith('127.')
+  hostname === 'localhost' || hostname === '[::1]' || loopbackIpv4.test(hostname)
 
 /**
  * Validate a parsed config document.

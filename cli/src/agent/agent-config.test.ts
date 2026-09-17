@@ -59,6 +59,33 @@ describe('parseAgentConfig', () => {
     expect(parseAgentConfig(document)).toBeNull()
   })
 
+  it.each([
+    ['headers', { id: 'x', transport: 'stdio', command: 'c', headers: { authorization: 'x' }, trustTools: false }],
+    ['url', { id: 'x', transport: 'stdio', command: 'c', url: 'https://mcp.example', trustTools: false }],
+  ])('rejects a stdio server carrying http-only %s', (_label, server) => {
+    // Accepting these and dropping them would send none of the auth headers an
+    // operator wrote, on an agent that reports itself healthy.
+    expect(parseAgentConfig({ version: 1, mcpServers: [server] })).toBeNull()
+  })
+
+  it.each([
+    ['command', { id: 'x', transport: 'http', url: 'https://mcp.example', command: 'uvx', trustTools: false }],
+    ['args', { id: 'x', transport: 'http', url: 'https://mcp.example', args: ['a'], trustTools: false }],
+    ['env', { id: 'x', transport: 'http', url: 'https://mcp.example', env: { A: 'b' }, trustTools: false }],
+  ])('rejects an http server carrying stdio-only %s', (_label, server) => {
+    expect(parseAgentConfig({ version: 1, mcpServers: [server] })).toBeNull()
+  })
+
+  it('rejects a misspelled field rather than ignoring it', () => {
+    // `trustTool` is the typo that matters most: silently ignored, it reads as
+    // granted trust while leaving every call gated.
+    const document = {
+      version: 1,
+      mcpServers: [{ id: 'x', transport: 'stdio', command: 'c', trustTools: false, trustTool: true }],
+    }
+    expect(parseAgentConfig(document)).toBeNull()
+  })
+
   it('rejects a config missing trustTools rather than assuming either answer', () => {
     // Defaulting to false would be safe but silent, and an operator who forgot
     // the field has not decided anything. Make them say it.
@@ -90,6 +117,40 @@ describe('parseAgentConfig', () => {
 
     expect(parseAgentConfig(remote)).toBeNull()
     expect(parseAgentConfig(local)).not.toBeNull()
+  })
+
+  const httpUrl = (url: string) => ({
+    version: 1,
+    mcpServers: [{ id: 'x', transport: 'http', url, trustTools: false }],
+  })
+
+  it.each([
+    // The URL parser canonicalizes every numeric shorthand to a dotted quad,
+    // so these all arrive as 127.0.0.1 and the plain pattern covers them.
+    'http://127.0.0.1:3000',
+    'http://127.1',
+    'http://2130706433',
+    'http://127.0.0.2',
+    'http://localhost:8080',
+    'http://[::1]:8080',
+    'http://[0:0:0:0:0:0:0:1]',
+  ])('allows plain http to loopback %s', (url) => {
+    expect(parseAgentConfig(httpUrl(url))).not.toBeNull()
+  })
+
+  it.each([
+    // Starts with `127.` but resolves wherever its owner points it — a prefix
+    // test would hand this host a bearer token in cleartext.
+    'http://127.0.0.1.evil.com',
+    'http://127.0.0.1.nip.io',
+    'http://localhost.evil.com',
+    'http://notlocalhost',
+  ])('rejects plain http to %s, which only looks local', (url) => {
+    expect(parseAgentConfig(httpUrl(url))).toBeNull()
+  })
+
+  it('still allows https to any host', () => {
+    expect(parseAgentConfig(httpUrl('https://127.0.0.1.evil.com'))).not.toBeNull()
   })
 
   it('rejects the whole document when one server is malformed', () => {

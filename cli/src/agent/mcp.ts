@@ -22,6 +22,7 @@ import type { AgentTool } from '@earendil-works/pi-agent-core'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { McpServerConfig } from './agent-config.ts'
 
 /** Pi's structural type for a tool's `parameters` (a TypeBox `TSchema`). */
@@ -64,7 +65,11 @@ const toPiContent = (blocks: readonly McpContentBlock[]) =>
     return { type: 'text' as const, text: `[unsupported MCP content: ${block.type}]` }
   })
 
-const createTransport = (server: McpServerConfig) => {
+/** Builds the client transport a server's config describes. Injected so tests
+ *  can link a client to an in-process server instead of spawning one. */
+export type TransportFactory = (server: McpServerConfig) => Transport
+
+const createTransport: TransportFactory = (server) => {
   if (server.transport === 'stdio') {
     return new StdioClientTransport({
       command: server.command as string,
@@ -83,11 +88,35 @@ const createTransport = (server: McpServerConfig) => {
   })
 }
 
-const connectServer = async (server: McpServerConfig): Promise<{ client: Client; tools: AgentTool[] }> => {
-  const client = new Client({ name: 'thunderbolt-agent', version: '1' }, { capabilities: {} })
-  await client.connect(createTransport(server))
+/**
+ * List a connected client's tools, closing it if that fails.
+ *
+ * The caller only learns about a client through this function's return value,
+ * so a `connect` that succeeds followed by a `listTools` that does not would
+ * otherwise orphan the client — and, for stdio, the child process it spawned —
+ * for the lifetime of the agent.
+ */
+const listToolsOrClose = async (client: Client) => {
+  try {
+    return await client.listTools()
+  } catch (error) {
+    try {
+      await client.close()
+    } catch {
+      // Already gone. Reporting this would bury the failure we are rethrowing.
+    }
+    throw error
+  }
+}
 
-  const listed = await client.listTools()
+const connectServer = async (
+  server: McpServerConfig,
+  buildTransport: TransportFactory,
+): Promise<{ client: Client; tools: AgentTool[] }> => {
+  const client = new Client({ name: 'thunderbolt-agent', version: '1' }, { capabilities: {} })
+  await client.connect(buildTransport(server))
+
+  const listed = await listToolsOrClose(client)
   const tools: AgentTool[] = listed.tools.map((tool) => {
     const namespaced = `${server.id}${nameSeparator}${tool.name}`
     return {
@@ -127,6 +156,7 @@ const connectServer = async (server: McpServerConfig): Promise<{ client: Client;
 export const createMcpRuntime = async (
   servers: readonly McpServerConfig[],
   report: (message: string) => void = (message) => process.stderr.write(`${message}\n`),
+  buildTransport: TransportFactory = createTransport,
 ): Promise<McpRuntime> => {
   if (servers.length === 0) return emptyMcpRuntime
 
@@ -136,7 +166,7 @@ export const createMcpRuntime = async (
 
   for (const server of servers) {
     try {
-      const connected = await connectServer(server)
+      const connected = await connectServer(server, buildTransport)
       clients.push(connected.client)
       for (const tool of connected.tools) {
         tools.push(tool)

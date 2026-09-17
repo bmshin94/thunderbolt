@@ -4,6 +4,9 @@
 # from the repo root so `shared/` is in context:
 #
 #   docker build -f cli/Dockerfile -t thunderbolt-agent .
+#
+# `Dockerfile.dockerignore` beside this file scopes the context to what the
+# image needs — see the note in it.
 FROM oven/bun:1.3-slim
 
 ENV NODE_ENV=production \

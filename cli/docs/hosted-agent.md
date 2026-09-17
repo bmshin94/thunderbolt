@@ -57,7 +57,12 @@ auto-allow lets one person's connection authorise a write on behalf of everyone.
 Marking a read-only documentation server trusted is reasonable; marking one that
 can write to production is a choice someone should make on purpose.
 
-Trust waives the prompt, not the mode. `read-only` still blocks a trusted tool.
+**The prompt is the only gate `true` removes, and here it is the only gate there
+is.** `acp serve` has no permission _mode_ — `read-only` and `accept-edits` are
+the local TUI's, and a client connected over ACP enforces its policy by
+answering prompts, which a trusted tool never raises. So a trusted server's
+tools are outside every connected client's reach by construction. Decide
+`trustTools` as if nothing downstream could override it, because nothing can.
 
 MCP servers can advertise read-only hints, and we deliberately do not honour
 them: that is the server describing itself, so trusting it would let a server opt
