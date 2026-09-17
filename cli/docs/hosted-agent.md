@@ -79,14 +79,21 @@ personal skill keeps working alongside the team's.
 ## Exposing it
 
 The app reaches a remote ACP agent over WebSocket, so the bridge has to be
-reachable. Three environment variables opt into that, and **all three are
-required together**:
+reachable. Three environment variables opt into that:
 
 | Variable                   | Purpose                                                                                          |
 | -------------------------- | ------------------------------------------------------------------------------------------------ |
 | `THUNDERBOLT_BRIDGE_HOST`  | `0.0.0.0` to bind beyond loopback. Unset means loopback, as before.                              |
 | `THUNDERBOLT_BRIDGE_TOKEN` | Stable secret, ≥32 chars. Without it the token changes on every restart and every client breaks. |
 | `THUNDERBOLT_APP_ORIGIN`   | Your app origin, so the upgrade's `Origin` check passes.                                         |
+
+**Setting the first without the second is a startup error.** A bind beyond
+loopback with no stable token would serve behind a secret that changes every
+restart and was only ever printed to the process's stdout — plausibly nowhere a
+platform keeps. The origin is not enforced the same way because omitting it
+announces itself: every browser upgrade is refused with a 403 naming the origin
+it saw, and the built-in Tauri origins are the right ones when the app and the
+bridge are simply on different machines on a LAN.
 
 Once the socket is public, the origin allowlist and the token are the entire
 boundary between the internet and a process that spawns agents. Terminate TLS in

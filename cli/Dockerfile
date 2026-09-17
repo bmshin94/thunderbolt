@@ -11,7 +11,9 @@ FROM oven/bun:1.3-slim
 
 ENV NODE_ENV=production \
     # Loopback is the library default; a container needs the port reachable.
-    # The origin allowlist and THUNDERBOLT_BRIDGE_TOKEN remain the boundary.
+    # The origin allowlist and THUNDERBOLT_BRIDGE_TOKEN remain the boundary, and
+    # because this is set the bridge refuses to start until you supply a token:
+    #   docker run -e THUNDERBOLT_BRIDGE_TOKEN="$(openssl rand -hex 32)" …
     THUNDERBOLT_BRIDGE_HOST=0.0.0.0 \
     # State root: provider config, account auth, ACP session logs. Mount a
     # volume here to keep sessions across restarts; otherwise resume finds

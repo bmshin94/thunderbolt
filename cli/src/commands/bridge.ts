@@ -220,17 +220,41 @@ export const resolveBridgeToken = (env: NodeJS.ProcessEnv = process.env): string
   return configured
 }
 
+const loopbackHost = '127.0.0.1'
+
 /**
  * Interface the bridge binds to. Loopback unless an operator opts out.
  *
  * Binding publicly is supported for a deployed agent, where the platform
  * terminates TLS in front of this process — but it is opt-in because the
  * origin allowlist and token become the only thing between the internet and a
- * process that spawns agents. A deployment that sets this must also set
- * `THUNDERBOLT_BRIDGE_TOKEN` and `THUNDERBOLT_APP_ORIGIN`.
+ * process that spawns agents.
+ *
+ * A public bind therefore **requires** an explicit `THUNDERBOLT_BRIDGE_TOKEN`
+ * and refuses to start without one, mirroring the short-token throw above. The
+ * generated fallback is right on loopback and wrong here twice over: it changes
+ * on every restart, so a redeploy silently breaks every configured client, and
+ * it is only ever written to this process's stdout — on a platform that
+ * discards that, nobody can reach the agent at all. `cli/Dockerfile` ships
+ * `THUNDERBOLT_BRIDGE_HOST=0.0.0.0`, so without this check a bare `docker run`
+ * would publish a process that spawns agents behind a secret nobody has.
+ *
+ * `THUNDERBOLT_APP_ORIGIN` is deliberately not required alongside it: omitting
+ * it announces itself — every browser upgrade is refused with a 403 naming the
+ * origin — and the built-in Tauri origins are the correct ones for the LAN case
+ * where the app and the bridge are on different machines.
  */
-export const resolveBridgeHost = (env: NodeJS.ProcessEnv = process.env): string =>
-  env.THUNDERBOLT_BRIDGE_HOST || '127.0.0.1'
+export const resolveBridgeHost = (env: NodeJS.ProcessEnv = process.env): string => {
+  const configured = env.THUNDERBOLT_BRIDGE_HOST
+  if (!configured) return loopbackHost
+  if (!env.THUNDERBOLT_BRIDGE_TOKEN) {
+    throw new Error(
+      'THUNDERBOLT_BRIDGE_HOST requires THUNDERBOLT_BRIDGE_TOKEN: a bind beyond loopback needs a stable ' +
+        'secret, and the per-run generated one changes on every restart. See cli/docs/hosted-agent.md.',
+    )
+  }
+  return configured
+}
 
 /** Constant-time token comparison. A length mismatch short-circuits to `false`
  *  (`timingSafeEqual` throws on unequal lengths); the token length is fixed and
@@ -283,6 +307,9 @@ export const authorizeUpgrade = (req: Request, token: string, allowedOrigins: Re
  */
 export const runBridge = async (config: BridgeConfig): Promise<void> => {
   const token = resolveBridgeToken()
+  // Resolved before the socket opens, so a public bind with no stable token
+  // fails at startup rather than serving until someone notices.
+  const host = resolveBridgeHost()
   const allowedOrigins = bridgeAllowedOrigins()
   // Cap concurrently-live agents: the upgrade gate authorizes *connections*, not
   // sessions, so an authorized client holding many sockets open would otherwise
@@ -294,7 +321,7 @@ export const runBridge = async (config: BridgeConfig): Promise<void> => {
     // exploitable. A deployed agent opts out with THUNDERBOLT_BRIDGE_HOST, at
     // which point those two gates are the whole boundary — see
     // docs/hosted-agent.md.
-    hostname: resolveBridgeHost(),
+    hostname: host,
     port: config.port,
     fetch(req, srv) {
       // Loopback alone is not a security boundary: WebSocket upgrades bypass CORS,
@@ -362,10 +389,9 @@ export const runBridge = async (config: BridgeConfig): Promise<void> => {
   // URL, so pasting it whole into the app authenticates with no client change.
   // A public bind reports the wildcard it was given rather than pretending to
   // know the deployment's external hostname — the operator substitutes it.
-  const advertisedHost = resolveBridgeHost()
-  const url = `ws://${advertisedHost}:${server.port}/?token=${token}`
+  const url = `ws://${host}:${server.port}/?token=${token}`
   process.stdout.write(
-    `⚡ thunderbolt ${config.protocol} bridge (${config.transport}) listening on ws://${advertisedHost}:${server.port}\n` +
+    `⚡ thunderbolt ${config.protocol} bridge (${config.transport}) listening on ws://${host}:${server.port}\n` +
       `   spawning per connection: ${redactArgv(config.command)}\n` +
       `   set this as the agent URL in the app (includes the access token): ${url}\n`,
   )

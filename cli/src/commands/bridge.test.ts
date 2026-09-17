@@ -205,6 +205,29 @@ describe('deployment configuration', () => {
   test('binds loopback unless an operator opts out', () => {
     expect(resolveBridgeHost({})).toBe('127.0.0.1')
     expect(resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '' })).toBe('127.0.0.1')
-    expect(resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0' })).toBe('0.0.0.0')
+  })
+
+  test('accepts a public bind that also configures a stable token', () => {
+    const env = { THUNDERBOLT_BRIDGE_HOST: '0.0.0.0', THUNDERBOLT_BRIDGE_TOKEN: 'a'.repeat(32) }
+    expect(resolveBridgeHost(env)).toBe('0.0.0.0')
+  })
+
+  test('refuses a public bind with no stable token', () => {
+    // The Dockerfile ships THUNDERBOLT_BRIDGE_HOST=0.0.0.0, so without this a
+    // bare `docker run` publishes a process that spawns agents behind a secret
+    // that only ever reached this process's stdout and changes every restart.
+    expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0' })).toThrow(
+      'THUNDERBOLT_BRIDGE_HOST requires THUNDERBOLT_BRIDGE_TOKEN',
+    )
+    expect(() => resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0', THUNDERBOLT_BRIDGE_TOKEN: '' })).toThrow(
+      'requires THUNDERBOLT_BRIDGE_TOKEN',
+    )
+  })
+
+  test('still rejects a public bind whose token is too short', () => {
+    // resolveBridgeToken owns the length floor; this only checks the two guards
+    // compose rather than one masking the other.
+    expect(resolveBridgeHost({ THUNDERBOLT_BRIDGE_HOST: '0.0.0.0', THUNDERBOLT_BRIDGE_TOKEN: 'short' })).toBe('0.0.0.0')
+    expect(() => resolveBridgeToken({ THUNDERBOLT_BRIDGE_TOKEN: 'short' })).toThrow('at least')
   })
 })
