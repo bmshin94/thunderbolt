@@ -1,5 +1,5 @@
 {
-  "id": "3446b064-6b29-4aa8-8822-03bb2abcaf0d",
+  "id": "608ca69c-efa3-45ab-abcb-dc9f77bb9ce6",
   "prevId": "614bcb17-0aae-424a-9727-c75b82e4b7f3",
   "version": "7",
   "dialect": "postgresql",
@@ -2569,6 +2569,30 @@
           "primaryKey": false,
           "notNull": false
         },
+        "recovery_ecdh_public_key": {
+          "name": "recovery_ecdh_public_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_mlkem_public_key": {
+          "name": "recovery_mlkem_public_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_wrapped_ak": {
+          "name": "recovery_wrapped_ak",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_attestation": {
+          "name": "recovery_attestation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "key_version": {
           "name": "key_version",
           "type": "integer",
@@ -2692,6 +2716,59 @@
         "envelopes_user_id_user_id_fk": {
           "name": "envelopes_user_id_user_id_fk",
           "tableFrom": "envelopes",
+          "tableTo": "user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.org_envelopes": {
+      "name": "org_envelopes",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "wrapped_ak": {
+          "name": "wrapped_ak",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "org_envelopes_user_id_user_id_fk": {
+          "name": "org_envelopes_user_id_user_id_fk",
+          "tableFrom": "org_envelopes",
           "tableTo": "user",
           "columnsFrom": [
             "user_id"

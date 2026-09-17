@@ -12,6 +12,13 @@ CREATE TABLE "challenge_nonces" (
 	"created_at" timestamp DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "org_envelopes" (
+	"user_id" text PRIMARY KEY NOT NULL,
+	"wrapped_ak" text NOT NULL,
+	"created_at" timestamp DEFAULT now() NOT NULL,
+	"updated_at" timestamp DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "wrapped_keys" (
 	"key_id" text NOT NULL,
 	"user_id" text NOT NULL,
@@ -23,10 +30,15 @@ CREATE TABLE "wrapped_keys" (
 --> statement-breakpoint
 ALTER TABLE "encryption_metadata" ADD COLUMN "signing_public_key" text;--> statement-breakpoint
 ALTER TABLE "encryption_metadata" ADD COLUMN "kdf_salt" text;--> statement-breakpoint
+ALTER TABLE "encryption_metadata" ADD COLUMN "recovery_ecdh_public_key" text;--> statement-breakpoint
+ALTER TABLE "encryption_metadata" ADD COLUMN "recovery_mlkem_public_key" text;--> statement-breakpoint
+ALTER TABLE "encryption_metadata" ADD COLUMN "recovery_wrapped_ak" text;--> statement-breakpoint
+ALTER TABLE "encryption_metadata" ADD COLUMN "recovery_attestation" text;--> statement-breakpoint
 ALTER TABLE "encryption_metadata" ADD COLUMN "key_version" integer DEFAULT 1 NOT NULL;--> statement-breakpoint
 ALTER TABLE "encryption_metadata" ADD COLUMN "primary_key_id" text DEFAULT '0' NOT NULL;--> statement-breakpoint
 ALTER TABLE "encryption_metadata" ADD COLUMN "scheme_version" smallint DEFAULT 1 NOT NULL;--> statement-breakpoint
 ALTER TABLE "challenge_nonces" ADD CONSTRAINT "challenge_nonces_user_id_user_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "org_envelopes" ADD CONSTRAINT "org_envelopes_user_id_user_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "wrapped_keys" ADD CONSTRAINT "wrapped_keys_user_id_user_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "idx_challenge_nonces_user_id" ON "challenge_nonces" USING btree ("user_id");--> statement-breakpoint
 CREATE INDEX "idx_wrapped_keys_user_id" ON "wrapped_keys" USING btree ("user_id");

@@ -208,36 +208,8 @@
     {
       "idx": 29,
       "version": "7",
-      "when": 1787862326481,
-      "tag": "0029_previous_vulture",
-      "breakpoints": true
-    },
-    {
-      "idx": 30,
-      "version": "7",
-      "when": 1787862578413,
-      "tag": "0030_serious_catseye",
-      "breakpoints": true
-    },
-    {
-      "idx": 31,
-      "version": "7",
-      "when": 1787862596042,
-      "tag": "0031_fat_the_hood",
-      "breakpoints": true
-    },
-    {
-      "idx": 32,
-      "version": "7",
-      "when": 1788958385215,
-      "tag": "0032_thick_microbe",
-      "breakpoints": true
-    },
-    {
-      "idx": 33,
-      "version": "7",
-      "when": 1789058654672,
-      "tag": "0033_new_molten_man",
+      "when": 1789645576066,
+      "tag": "0029_e2ee_v2",
       "breakpoints": true
     }
   ]
