@@ -179,18 +179,24 @@ export const parseAgentConfig = (value: unknown): AgentConfig | null => {
  */
 export const loadAgentConfig = async (env: NodeJS.ProcessEnv = process.env): Promise<AgentConfig> => {
   const path = agentConfigPath(env)
-  let contents: string
-  try {
-    contents = await readFile(path, 'utf8')
-  } catch (error) {
-    if (isMissingFileError(error)) return emptyAgentConfig
-    throw error
-  }
+  const contents = await readFileOrNull(path)
+  if (contents === null) return emptyAgentConfig
 
   const invalid = new Error(`Invalid agent config at ${path}`)
   const parsed = parseAgentConfig(parseJson(contents, invalid))
   if (parsed === null) throw invalid
   return parsed
+}
+
+/** Reads a file, distinguishing "not there" (null) from every other failure,
+ *  which still throws — an unreadable config is not an absent one. */
+const readFileOrNull = async (path: string): Promise<string | null> => {
+  try {
+    return await readFile(path, 'utf8')
+  } catch (error) {
+    if (isMissingFileError(error)) return null
+    throw error
+  }
 }
 
 const isMissingFileError = (error: unknown): boolean =>

@@ -178,6 +178,13 @@ describe('loadAgentConfig', () => {
     expect((await loadAgentConfig({ THUNDERBOLT_AGENT_CONFIG: path })).skills).toEqual([skill])
   })
 
+  it('throws when the path is unreadable for any reason other than absence', async () => {
+    // Only ENOENT means "no config". Anything else — a directory at the path, a
+    // permission error — is a broken deployment, not an agent without skills.
+    const dir = await mkdtemp(join(tmpdir(), 'tb-agent-config-'))
+    await expect(loadAgentConfig({ THUNDERBOLT_AGENT_CONFIG: dir })).rejects.toThrow()
+  })
+
   it('throws on a present-but-invalid file rather than starting without it', async () => {
     const path = await writeConfig(JSON.stringify({ version: 9 }))
     await expect(loadAgentConfig({ THUNDERBOLT_AGENT_CONFIG: path })).rejects.toThrow('Invalid agent config')
