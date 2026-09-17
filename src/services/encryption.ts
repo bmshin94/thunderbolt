@@ -25,21 +25,9 @@ import {
   mintDEK,
   rewrapKeyring,
   unwrapLegacyCK,
-  mintCanary,
-  unwrapCanaryKey,
-  recoverCanarySecretV1,
-  deriveSigningKeyPair,
-  signChallenge,
-  signRecoveryAttestation,
-  verifyRecoveryAttestation,
   DecryptionError,
   decrypt,
   encrypt,
-  generateRecoverySeed,
-  encodeRecoverySeed,
-  decodeRecoveryKey,
-  deriveRecoveryKeyPairFromSeed,
-  generateKdfSalt,
   storeKeyPair,
   getKeyPair,
   openBindNonce,
@@ -100,6 +88,15 @@ import {
   type RecoverySlotRequest,
   type WrappedKeyEntry,
 } from '@shared/e2ee-types'
+
+/**
+ * The canary/signing and recovery-key modules carry ~44 KB (minified) of
+ * @noble P-256/BIP-39 code that only these user-initiated flows need, so they
+ * load lazily to stay out of the entry bundle (see src/crypto/index.ts).
+ * Every caller is already network-bound, so the one-time chunk fetch is free.
+ */
+const loadCanary = () => import('@/crypto/canary')
+const loadRecoveryKey = () => import('@/crypto/recovery-key')
 
 // =============================================================================
 // Errors
@@ -295,6 +292,7 @@ const readCanaryKey = async (httpClient: HttpClient): Promise<CryptoKey> => {
   if (!ak) {
     throw new Error('Account key not found in IndexedDB')
   }
+  const { unwrapCanaryKey } = await loadCanary()
   return unwrapCanaryKey(ak, getUserId(), metadata.canary_iv, metadata.canary_ctext)
 }
 
@@ -335,6 +333,7 @@ const buildProof = async (
   const key = canaryKey ?? (await getCanaryKey(httpClient))
   const { nonce } = await fetchChallenge(httpClient, operation)
   const deviceId = getDeviceId()
+  const { signChallenge } = await loadCanary()
   const signature = await signChallenge(key, nonce, operation, deviceId)
   return { signature, nonce, operation, deviceId }
 }
@@ -392,6 +391,7 @@ const buildRecoverySlot = async (
 ): Promise<RecoverySlotRequest> => {
   const recoveryEcdhPublicKey = await exportPublicKey(recovery.ecdhPublicKey)
   const recoveryMlkemPublicKey = exportMlKemPublicKey(recovery.mlkemPublicKey)
+  const { signRecoveryAttestation } = await loadCanary()
   return {
     recoveryEcdhPublicKey,
     recoveryMlkemPublicKey,
@@ -417,6 +417,8 @@ type RecoveryPlan = { kdfSalt: string; publicKeys: RecoveryPublicKeys } & (
 
 /** Mint a fresh 24-word phrase and the recovery keypair it derives. */
 const mintRecoveryPlan = async (): Promise<Extract<RecoveryPlan, { mode: 'new' }>> => {
+  const { generateRecoverySeed, encodeRecoverySeed, generateKdfSalt, deriveRecoveryKeyPairFromSeed } =
+    await loadRecoveryKey()
   const seed = generateRecoverySeed()
   const recoveryPhrase = encodeRecoverySeed(seed)
   const kdfSalt = generateKdfSalt()
@@ -450,6 +452,7 @@ const readStoredRecoveryPlan = async (httpClient: HttpClient, canaryKey: CryptoK
     recoveryEcdhPublicKey: metadata.recovery_ecdh_public_key,
     recoveryMlkemPublicKey: metadata.recovery_mlkem_public_key,
   }
+  const { verifyRecoveryAttestation } = await loadCanary()
   if (
     !metadata.recovery_attestation ||
     !(await verifyRecoveryAttestation(canaryKey, metadata.recovery_attestation, anchor))
@@ -887,6 +890,7 @@ export const completeFirstDeviceSetup = async (httpClient: HttpClient): Promise<
   // Anchored to the AK, not DEK "0" (THU-872) — `canaryKey` is the unwrap of the
   // exact bytes being posted, so the published signing key is correct by
   // construction (the pre-submit round-trip check).
+  const { mintCanary, deriveSigningKeyPair } = await loadCanary()
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(extractableAK, getUserId())
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
@@ -1073,6 +1077,7 @@ export const checkApprovalAndUnwrap = async (httpClient: HttpClient): Promise<bo
  * challenges — the signature is the gate).
  */
 export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: string): Promise<void> => {
+  const { decodeRecoveryKey, deriveRecoveryKeyPairFromSeed } = await loadRecoveryKey()
   const seed = decodeRecoveryKey(recoveryPhrase)
 
   const metadata = await fetchEncryptionMetadata(httpClient)
@@ -1136,6 +1141,7 @@ export const recoverWithKey = async (httpClient: HttpClient, recoveryPhrase: str
   // that no longer matches the live epoch fails to open it. DEK '0' is unwrapped
   // separately, ONLY for the keyring witness below — the two paths share no
   // variable.
+  const { unwrapCanaryKey } = await loadCanary()
   const canaryKey = await unwrapCanaryKey(ak, getUserId(), metadata.canary_iv, metadata.canary_ctext).catch(() => null)
   if (!canaryKey) {
     throw new ValidationError('Invalid recovery key')
@@ -1411,6 +1417,7 @@ const runAKRotation = async (
   // Minted BEFORE the recovery slot: the slot's attestation must be signed with
   // the NEW canary key, since that is the key the next rotation will derive
   // to verify it (THU-865).
+  const { mintCanary, deriveSigningKeyPair } = await loadCanary()
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(newAK, getUserId())
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 
@@ -1721,6 +1728,7 @@ const resolveLegacyCK = async (
   // D1 possession proof: only a CK matching the served canary recovers its secret.
   // A2 authors both the envelope and the canary, so this alone proves nothing —
   // hence the check below, against material A2 does not author.
+  const { recoverCanarySecretV1 } = await loadCanary()
   const possessionProof = await recoverCanarySecretV1(legacyCK, canary.iv, canary.ctext)
   if (!possessionProof) {
     return null
@@ -1782,6 +1790,7 @@ export const migrateToV2 = async (httpClient: HttpClient, opts: MigrateToV2Optio
 
   // Anchored to the new AK (THU-872); the v1 possession proof below still uses
   // the LEGACY canary the server currently stores — two different artifacts.
+  const { mintCanary, deriveSigningKeyPair } = await loadCanary()
   const { canaryIv, canaryCtext, canaryKey } = await mintCanary(newAK, getUserId())
   const { publicKeySpki } = await deriveSigningKeyPair(canaryKey)
 

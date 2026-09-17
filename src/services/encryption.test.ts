@@ -15,16 +15,8 @@ import {
   wrapAK,
   wrapDEK,
   unwrapDEK,
-  deriveRecoveryKeyPairFromSeed,
-  deriveSigningKeyPair,
-  signRecoveryAttestation,
   unwrapAK,
   wrapLegacyCK,
-  generateRecoverySeed,
-  encodeRecoverySeed,
-  decodeRecoveryKey,
-  generateKdfSalt,
-  mintCanary,
   encrypt,
   decrypt,
   exportPublicKey,
@@ -37,6 +29,14 @@ import {
   type KeyringAnchor,
   type StoredKeyPair,
 } from '@/crypto'
+import { deriveSigningKeyPair, mintCanary, signRecoveryAttestation } from '@/crypto/canary'
+import {
+  decodeRecoveryKey,
+  deriveRecoveryKeyPairFromSeed,
+  encodeRecoverySeed,
+  generateKdfSalt,
+  generateRecoverySeed,
+} from '@/crypto/recovery-key'
 import { clearRecoveryPhrasePending, isRecoveryPhrasePending } from '@/lib/recovery-phrase-pending'
 import { type KeyId, deviceBindHkdfInfo, ecdhKeyAlgorithm, initialKeyId, isMintableKeyId } from '@shared/e2ee-types'
 

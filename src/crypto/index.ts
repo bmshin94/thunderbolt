@@ -36,33 +36,20 @@ export {
   type EncryptedBytes,
 } from './primitives'
 
-// Canary + challenge-response signing
-export {
-  mintCanary,
-  unwrapCanaryKey,
-  recoverCanarySecretV1,
-  deriveSigningKeyPair,
-  signChallenge,
-  signRecoveryAttestation,
-  verifyRecoveryAttestation,
-  type RecoveryAnchor,
-  type SigningKeyPair,
-} from './canary'
+// Canary + challenge-response signing, and the recovery key (seed <-> mnemonic,
+// KDF -> recovery-slot keypair), are deliberately NOT re-exported at runtime:
+// they pull ~44 KB (minified) of @noble P-256/BIP-39 code that no boot-path
+// caller needs. Import them with `await import('@/crypto/canary')` /
+// `await import('@/crypto/recovery-key')` inside the user-initiated flow that
+// needs them (see src/services/encryption.ts) so the weight stays out of the
+// entry bundle. Their types are free to re-export.
+export type { RecoveryAnchor, SigningKeyPair } from './canary'
 
 // Local witness to DEK "0"'s material — gates inbound AK adoption (THU-869)
 export { anchorVersion, mintKeyringAnchor, keyringAnchorOpens, type KeyringAnchor } from './keyring-anchor'
 
 // Device–session binding (client half of the sealed-nonce handshake)
 export { openBindNonce } from './device-bind'
-
-// Recovery key (seed <-> mnemonic, KDF -> recovery-slot hybrid keypair)
-export {
-  generateRecoverySeed,
-  encodeRecoverySeed,
-  decodeRecoveryKey,
-  deriveRecoveryKeyPairFromSeed,
-  generateKdfSalt,
-} from './recovery-key'
 
 // Key storage (IndexedDB)
 export {
