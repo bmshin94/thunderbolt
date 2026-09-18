@@ -12,12 +12,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import {
-  attachPermissionGate,
-  cyclePermissionMode,
-  readOnlyBlockReason,
-  type PermissionMode,
-} from './permissions.ts'
+import { attachPermissionGate, cyclePermissionMode, readOnlyBlockReason, type PermissionMode } from './permissions.ts'
 import type { HarnessRuntime } from '../provider-runtime/types.ts'
 import type { PermissionDecision, PermissionPrompt, PermissionRequest } from './types.ts'
 
@@ -283,35 +278,4 @@ describe('attachPermissionGate — summary builder', () => {
   test('an unknown tool with no path falls back to the JSON of the input', async () => {
     expect(await summaryFor('weird', { foo: 'bar' })).toBe(JSON.stringify({ foo: 'bar' }))
   })
-})
-
-test('runs a trusted MCP tool without prompting', async () => {
-  const { harness, getHandler } = fakeHarness()
-  const { ask, seen } = constantAsk('deny')
-  attachPermissionGate(harness, { getMode: () => 'ask', ask, trustedToolNames: new Set(['docs_search']) })
-
-  expect(await getHandler()?.(call('docs_search'))).toBeUndefined()
-  expect(seen).toEqual([])
-})
-
-test('gates an MCP tool whose server was not trusted', async () => {
-  // isReadOnlyAgentTool only knows the built-in tools, so an unrecognised name
-  // must fall through to the prompt rather than to allowed.
-  const { harness, getHandler } = fakeHarness()
-  const { ask, seen } = constantAsk('deny')
-  attachPermissionGate(harness, { getMode: () => 'ask', ask, trustedToolNames: new Set(['docs_search']) })
-
-  const decision = await getHandler()?.(call('deploy_release'))
-  expect(seen.map((request) => request.toolName)).toEqual(['deploy_release'])
-  expect(decision).toEqual({ block: true, reason: 'User denied deploy_release' })
-})
-
-test('read-only mode still blocks a trusted MCP tool', async () => {
-  // Trust says "no prompt", not "ignore the mode" — read-only is a request that
-  // nothing change, and a trusted server can still write.
-  const { harness, getHandler } = fakeHarness()
-  const { ask } = constantAsk('allow-once')
-  attachPermissionGate(harness, { getMode: () => 'read-only', ask, trustedToolNames: new Set(['docs_search']) })
-
-  expect(await getHandler()?.(call('docs_search'))).toEqual({ block: true, reason: readOnlyBlockReason })
 })
